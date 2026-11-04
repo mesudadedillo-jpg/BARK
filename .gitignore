@@ -1,0 +1,22 @@
+# Entorno
+venv/
+.venv/
+__pycache__/
+*.pyc
+.env
+
+# Datos personales (memoria, historial y resultados generados)
+bd_memoria/*
+!bd_memoria/.gitkeep
+resultados/*
+!resultados/.gitkeep
+tmp*/
+respaldo_antes_de_optimizar/
+
+# Modelos pesados: se descargan aparte (ver modelos/README.md)
+modelos/**/*.gguf
+modelos/**/*.onnx
+modelos/**/*.onnx.json
+modelos/**/*.task
+modelos/whisper/*
+!modelos/whisper/.gitkeep
