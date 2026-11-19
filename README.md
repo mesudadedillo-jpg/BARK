@@ -9,7 +9,8 @@
 ![LLM local](https://img.shields.io/badge/LLM-Qwen3%20GGUF%20·%20llama.cpp-8A2BE2)
 ![Voz](https://img.shields.io/badge/Voz-Whisper%20%2B%20Piper-00B894)
 ![Visión](https://img.shields.io/badge/Visión-MediaPipe-FF6F00)
-![Tests](https://img.shields.io/badge/tests-62%20unitarios-success)
+![MCP](https://img.shields.io/badge/Conectores-MCP-D97757)
+![Tests](https://img.shields.io/badge/tests-94%20unitarios-success)
 
 </div>
 
@@ -17,7 +18,7 @@
 
 Dices **«Bark, abre Spotify y pon algo de Daft Punk»** y Bark lo hace. Dices **«mi pc va lenta»** y la diagnostica, libera RAM, limpia temporales y te explica qué la está frenando. Si se va el internet, **sigue funcionando**: el cerebro, el oído y la voz corren en tu propia máquina.
 
-Bark no es un chatbot con micrófono. Es un **agente**: entiende lo que pides, elige entre **61 herramientas reales** del sistema operativo, las ejecuta, pide permiso antes de lo delicado y recuerda lo que le contaste entre sesiones.
+Bark no es un chatbot con micrófono. Es un **agente**: entiende lo que pides, elige entre **123 herramientas reales organizadas en 20 conectores** (como los de Claude), las ejecuta, pide permiso antes de lo delicado y recuerda lo que le contaste entre sesiones. Y si le conectas un servidor **MCP**, gana las herramientas de GitHub, Google Drive, Notion o cualquier otro servicio sin escribir código.
 
 ## ✨ Lo que lo hace diferente
 
@@ -28,6 +29,8 @@ Bark no es un chatbot con micrófono. Es un **agente**: entiende lo que pides, e
 | ⚡ **Respuesta instantánea** | Las órdenes comunes (volumen, apps, temporizadores, batería…) se resuelven con un enrutador local **sin pasar por el LLM**. Solo lo que necesita razonar llega al modelo. |
 | 🔒 **Privado por diseño** | Memoria en SQLite local con respaldos automáticos. Los recuerdos marcados como **sensibles nunca entran a un prompt de nube**. La cámara es opt-in y ningún fotograma sale del equipo. |
 | 🛡️ **Seguro** | Apagar, borrar o desactivar programas de inicio **siempre pide confirmación** (por voz o en pantalla). La edición de código usa reemplazos exactos y verifica la sintaxis después. |
+| 🔌 **Conectores como Claude** | Cada área (red, archivos, agenda, WhatsApp, winget, MCP…) es un conector con sus herramientas. Un **buscador de herramientas** le muestra al modelo solo las ~12 relevantes por turno, para que un LLM local de 4B no se pierda entre 123. |
+| 🔎 **Entiende nombres aproximados** | Si algo no existe, busca lo más parecido: herramientas inventadas por el modelo, parámetros mal nombrados, rutas («Escritorio\bark ai»), archivos, contactos, redes Wi-Fi, servicios, monedas o unidades. Si hay empate, pregunta. |
 | 🖐️ **Control por gestos** | Con MediaPipe: **palma abierta = activar voz, puño = suspender**. Todo procesado localmente. |
 
 ## 🛠️ Qué puede hacer
@@ -36,32 +39,52 @@ Bark no es un chatbot con micrófono. Es un **agente**: entiende lo que pides, e
 <tr><td width="50%" valign="top">
 
 **🖥️ Control del equipo**
-- Abrir apps por nombre hablado, incluidas apps de la Tienda sin acceso directo, con *fuzzy matching* para errores de dictado («spotifi»)
-- Volumen, brillo, bloqueo, suspensión, apagado programado
-- Listar y enfocar ventanas, portapapeles, ajustes de Windows
-- Temporizadores y recordatorios con aviso
+- Abrir apps por nombre hablado, incluidas apps de la Tienda, con *fuzzy matching* para errores de dictado («spotifi»)
+- Volumen, brillo, bloqueo, suspensión, apagado programado, ventanas, portapapeles y ajustes de Windows
+- Especificaciones, uso de CPU/RAM, procesos, servicios, impresoras y dispositivos USB/audio
 
-**🚀 Optimización del PC**
-- Diagnóstico de RAM por proceso y liberación sin cerrar apps
-- Limpieza de temporales, caché DNS y planes de energía
-- Revisión de programas de inicio (registro, carpetas y tareas)
+**🚀 Optimización y software**
+- Diagnóstico de RAM, temporales, caché DNS, planes de energía y programas de inicio
+- **Instala, actualiza y desinstala programas con winget** por nombre aproximado
+
+**🌐 Red e internet**
+- Estado de conexión, IP local y pública, ping, redes Wi-Fi cercanas y conectarse a una guardada
+- Dispositivos Bluetooth emparejados
+
+**🗂️ Archivos**
+- Buscar archivos y carpetas por nombre parecido en todas tus carpetas personales
+- Copiar, mover, renombrar, mandar a la papelera, comprimir y extraer ZIP, espacio en disco
 
 </td><td width="50%" valign="top">
 
-**📄 Archivos y documentos**
-- Buscar archivos locales por nombre y fecha, abrirlos y convertirlos
-- Leer PDF y Word; **investigar un tema y generar un .docx** con formato APA
+**📅 Productividad**
+- Notas rápidas, lista de pendientes, agenda («¿qué tengo mañana?») y recordatorios a una hora
+- Contactos locales; **prepara WhatsApp y correos** para que tú los envíes
 
-**🌐 Web y multimedia**
-- Búsqueda web y extracción de páginas
-- Control de Spotify y búsqueda de canciones
-- Descarga de video/audio con `yt-dlp`, capturas de pantalla
+**☁️ Información al momento (sin API keys)**
+- Clima y pronóstico (Open-Meteo), tipo de cambio, Wikipedia, Google Noticias y conversión de unidades
 
-**👨‍💻 Modo ingeniero de software**
-- Explora un proyecto, lee código, aplica ediciones exactas y verifica la sintaxis de Python
+**📄 Documentos y multimedia**
+- Leer PDF y Word, **investigar un tema y generar un .docx APA**, convertir DOCX↔PDF
+- Spotify, búsqueda de canciones, descarga de video/audio, capturas, búsquedas en YouTube, Maps, Amazon o Mercado Libre
+
+**👨‍💻 Desarrollo**
+- Explora y edita código con reemplazos exactos, estado e historial de Git, abrir en VS Code, terminal PowerShell con permiso
+
+**🔌 MCP**
+- Cliente propio del Model Context Protocol (stdio y HTTP): cualquier servidor MCP se vuelve un conector
 
 </td></tr>
 </table>
+
+### 🗣️ Pruébalo
+
+```text
+«¿Qué clima hace mañana en Pachuca?»          «Instala Discord»
+«Mándale un WhatsApp a mamá que ya voy»        «Anota comprar tortillas»
+«Recuérdame a las 5 que saque la ropa»         «Convierte 100 dólares a pesos»
+«Busca la carpeta de tareas de ética»          «¿Qué conectores tienes?»
+```
 
 ## 🏗️ Arquitectura
 
@@ -73,9 +96,11 @@ flowchart LR
     VIS --> UI
     STT --> R{"Enrutador<br/>local"}
     R -- "orden directa" --> T
-    R -- "requiere razonar" --> C["🧠 Cerebro<br/>bucle de herramientas JSON"]
+    R -- "requiere razonar" --> S["🔎 Buscador de<br/>herramientas"]
+    S --> C["🧠 Cerebro<br/>bucle de herramientas JSON"]
     C <--> P["Proveedores<br/>Gemini → OpenAI → Qwen local"]
-    C --> T["🛠️ 61 herramientas<br/>sistema · archivos · web · media"]
+    C --> T["🔌 Registro de conectores<br/>123 herramientas · búsqueda difusa"]
+    T <--> MCP["Servidores MCP<br/>GitHub · Drive · …"]
     C <--> M[("🗃️ Memoria SQLite<br/>recuerdos + historial")]
     T --> C
     C --> TTS["🔊 Gemini TTS → OpenAI TTS → Piper"]
@@ -92,13 +117,18 @@ bark/
 │   ├── vision.py        # gestos y rostro con MediaPipe (local)
 │   ├── bd_manager.py    # memoria y biblioteca en SQLite
 │   └── servicio.py      # asistente de voz en segundo plano
+├── conectores/
+│   ├── registro.py      # conectores, herramientas, permisos y corrección de errores del modelo
+│   ├── similitud.py     # búsqueda difusa de nombres, rutas y archivos
+│   ├── mcp.py           # cliente Model Context Protocol (stdio + HTTP)
+│   └── …                # red, software, productividad, comunicación, información, desarrollo…
 ├── acciones/
 │   ├── comandos.py      # herramientas: archivos, web, documentos, media
 │   ├── apps.py          # índice inteligente de apps de Windows
 │   └── sistema.py       # volumen, brillo, energía, ventanas, temporizadores
-├── interfaz/ui.py       # interfaz translúcida con centro de optimización
+├── interfaz/ui.py       # interfaz translúcida: chat, voz, panel de conectores y optimización
 ├── config/              # configuración, personalidad, .env.example
-└── tests/               # 62 pruebas unitarias
+└── tests/               # 94 pruebas unitarias (incluye un servidor MCP falso)
 ```
 
 ## 🚀 Instalación
@@ -137,8 +167,15 @@ Todo se ajusta en `.env`, sin tocar código. Lo principal:
 | `BARK_GPU_LAYERS` | `-1` para usar GPU con llama-cpp-python |
 | `BARK_MODELO_WHISPER` | `base` (rápido) o `small` (más preciso) |
 | `BARK_VOZ_DEBUG` | `1` guarda el último audio recibido para diagnosticar el micrófono |
+| `BARK_CIUDAD` | Ciudad para el clima cuando no dices cuál |
 
 La guía completa de órdenes y ajustes está en [`docs/GUIA.md`](docs/GUIA.md).
+
+## 🔌 Conectores y MCP
+
+Abre **Conectores y herramientas** en la interfaz o di «¿qué conectores tienes?» para ver qué está listo en tu equipo. Para sumar servicios externos, copia `config/conectores_mcp.example.json` como `conectores_mcp.json` y activa servidores MCP (archivos, GitHub, fetch…); los tokens van en `.env`.
+
+[`docs/CONECTORES.md`](docs/CONECTORES.md) explica cómo funciona el registro, cómo crear un conector nuevo en 10 líneas y trae el catálogo completo de herramientas.
 
 ## 🧪 Pruebas
 
@@ -146,14 +183,15 @@ La guía completa de órdenes y ajustes está en [`docs/GUIA.md`](docs/GUIA.md).
 python -m unittest discover tests
 ```
 
-62 pruebas cubren el enrutador de órdenes, la detección de recuerdos y datos sensibles, la resolución de apps, la limpieza de texto para voz y la segmentación por frases.
+94 pruebas cubren el enrutador de órdenes, el registro de conectores (nombres inventados, parámetros y rutas mal escritas, permisos), el cliente MCP contra un servidor falso, notas/pendientes/agenda, fechas y horas en español, clima y divisas simulados, la detección de recuerdos y datos sensibles, la resolución de apps y la voz.
 
 ## 🗺️ Roadmap
 
 - [ ] Instalador `.exe` de un clic
 - [ ] Nodo en Raspberry Pi y app móvil conectados por WireGuard
 - [ ] Memoria semántica con embeddings (pgvector)
-- [ ] Automatización del hogar vía MQTT
+- [ ] Automatización del hogar vía MQTT / Home Assistant (como conector)
+- [ ] Panel para activar y desactivar conectores sin editar JSON
 
 ## 👤 Autor
 

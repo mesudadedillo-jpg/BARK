@@ -10,25 +10,72 @@ import re
 import unicodedata
 import threading
 import ast
-import difflib
-import inspect
 import operator
 from datetime import datetime
 from urllib.parse import quote_plus
-try:
-    from llama_cpp import Llama
-except ImportError:  # Permite usar nube/UI aunque falte el respaldo local.
-    Llama = None
+Llama = None
+ERROR_LLAMA = None
+_llama_intentado = False
+
+
+def _control_inteligente_activo() -> bool:
+    """True si Smart App Control está en modo de aplicación (bloquea DLL sin firma)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\CI\Policy") as clave:
+            valor, _tipo = winreg.QueryValueEx(clave, "VerifiedAndReputablePolicyState")
+        return int(valor) == 1
+    except OSError:
+        return False
+
+
+def _importar_llama():
+    """Carga llama-cpp solo cuando hace falta y una sola vez.
+
+    Si Windows (Control inteligente de aplicaciones) bloquea llama.dll, se suprime
+    su ventana de «Imagen incorrecta» y Bark sigue funcionando con la nube.
+    """
+    global Llama, ERROR_LLAMA, _llama_intentado
+    if _llama_intentado:
+        return Llama
+    _llama_intentado = True
+    preferencia = os.getenv("BARK_MODELO_LOCAL", "auto").strip().lower()
+    if preferencia in {"0", "no", "false", "off"}:
+        ERROR_LLAMA = "desactivado con BARK_MODELO_LOCAL=0"
+        return None
+    if preferencia != "1" and _control_inteligente_activo():
+        # Con el Control inteligente de aplicaciones activo, Windows bloquea llama.dll
+        # y muestra «Imagen incorrecta» aunque se capture el error: mejor ni intentarlo.
+        ERROR_LLAMA = ("Windows (Control inteligente de aplicaciones) bloquea llama.dll; "
+                       "usa la nube o un motor firmado como Ollama")
+        return None
+    modo_anterior = None
+    if sys.platform == "win32":
+        import ctypes
+        # SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX: sin cuadros de error del sistema.
+        modo_anterior = ctypes.windll.kernel32.SetErrorMode(0x8003)
+    try:
+        from llama_cpp import Llama as _Llama
+        Llama = _Llama
+    except Exception as error:
+        ERROR_LLAMA = str(error)
+    finally:
+        if modo_anterior is not None:
+            ctypes.windll.kernel32.SetErrorMode(modo_anterior)
+    return Llama
 
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import config
-from acciones import apps, comandos, sistema
+from acciones import apps, comandos
 from nucleo.historial import historial_sesion
 from nucleo.bd_manager import biblioteca_conversaciones, buscar_recuerdos, guardar_recuerdo, guardar_turno
 from nucleo.proveedores import responder
+from conectores import REGISTRO, mcp as conectores_mcp
 
 
 # ============================================================
@@ -65,8 +112,8 @@ def cargar_modelo():
     global _modelo
     with _bloqueo_modelo:
         if _modelo is None:
-            if Llama is None:
-                raise RuntimeError("Falta llama-cpp-python; instala requirements.txt para habilitar el respaldo local.")
+            if _importar_llama() is None:
+                raise RuntimeError(f"El modelo local no está disponible: {ERROR_LLAMA or 'falta llama-cpp-python'}")
             rutas = [r for r in [config.RUTA_MODELO, *config.RUTAS_MODELO_RESPALDO] if os.path.isfile(r)]
             if not rutas:
                 raise RuntimeError(f"No se encontró el modelo local: {config.RUTA_MODELO}")
@@ -86,103 +133,44 @@ def cargar_modelo():
 
 
 # ============================================================
-# DEFINICION DE HERRAMIENTAS DISPONIBLES PARA EL LLM
+# HERRAMIENTAS: viven en el registro de conectores (conectores/)
 # ============================================================
 
-HERRAMIENTAS_DISPONIBLES = {
-    "abrir_aplicacion": comandos.abrir_aplicacion,
-    "abrir_ubicacion": comandos.abrir_ubicacion,
-    "buscar_y_abrir_aplicacion": comandos.buscar_y_abrir_aplicacion,
-    "listar_aplicaciones_instaladas": comandos.listar_aplicaciones_instaladas,
-    "listar_juegos_instalados": comandos.listar_juegos_instalados,
-    "cerrar_aplicacion": comandos.cerrar_aplicacion,
-    "diagnosticar_equipo": comandos.diagnosticar_equipo,
-    "diagnosticar_ram_avanzado": comandos.diagnosticar_ram_avanzado,
-    "liberar_ram_avanzada": comandos.liberar_ram_avanzada,
-    "listar_elementos_inicio": comandos.listar_elementos_inicio,
-    "desactivar_elemento_inicio": comandos.desactivar_elemento_inicio,
-    "resumen_optimizacion": comandos.resumen_optimizacion,
-    "limpiar_temporales_usuario": comandos.limpiar_temporales_usuario,
-    "explorar_proyecto": comandos.explorar_proyecto,
-    "leer_archivo_codigo": comandos.leer_archivo_codigo,
-    "reemplazar_texto_archivo": comandos.reemplazar_texto_archivo,
-    "verificar_archivo_python": comandos.verificar_archivo_python,
-    "crear_carpeta": comandos.crear_carpeta,
-    "listar_archivos": comandos.listar_archivos,
-    "buscar_archivos_locales": comandos.buscar_archivos_locales,
-    "abrir_archivo_encontrado": comandos.abrir_archivo_encontrado,
-    "convertir_documento": comandos.convertir_documento,
-    "eliminar_archivo": comandos.eliminar_archivo,
-    "escribir_archivo": comandos.escribir_archivo,
-    "buscar_informacion": comandos.buscar_informacion,
-    "extraer_texto_pagina": comandos.extraer_texto_pagina,
-    "abrir_en_navegador": comandos.abrir_en_navegador,
-    "leer_documento": comandos.leer_documento,
-    "crear_documento_word": comandos.crear_documento_word,
-    "investigar_y_crear_word": comandos.investigar_y_crear_word,
-    "tomar_captura_pantalla": comandos.tomar_captura_pantalla,
-    "descargar_video": comandos.descargar_video,
-    "ejecutar_script_python": comandos.ejecutar_script_python,
-    "cerrar_pestana_navegador": comandos.cerrar_pestana_navegador,
-    "controlar_spotify": comandos.controlar_spotify,
-    "buscar_y_reproducir_spotify": comandos.buscar_y_reproducir_spotify,
-    "buscar_canciones": comandos.buscar_canciones,
-    "reproducir_cancion_encontrada": comandos.reproducir_cancion_encontrada,
-    "crear_carpeta_resultados": comandos.crear_carpeta_resultados,
-    "consultar_memoria": lambda consulta="": _formatear_recuerdos(consulta, incluir_sensibles=True),
-    "consultar_biblioteca": lambda periodo="hoy", consulta="": _formatear_biblioteca(periodo, consulta),
-    # --- control del equipo (acciones/sistema.py) ---
-    "abrir_configuracion": sistema.abrir_configuracion,
-    "controlar_volumen": sistema.controlar_volumen,
-    "fijar_volumen": sistema.fijar_volumen,
-    "fijar_brillo": sistema.fijar_brillo,
-    "estado_bateria": sistema.estado_bateria,
-    "bloquear_pc": sistema.bloquear_pc,
-    "minimizar_todo": sistema.minimizar_todo,
-    "apagar_pc": sistema.apagar_pc,
-    "reiniciar_pc": sistema.reiniciar_pc,
-    "suspender_pc": sistema.suspender_pc,
-    "cancelar_apagado": sistema.cancelar_apagado,
-    "listar_ventanas_abiertas": sistema.listar_ventanas_abiertas,
-    "enfocar_ventana": sistema.enfocar_ventana,
-    "leer_portapapeles": sistema.leer_portapapeles,
-    "copiar_al_portapapeles": sistema.copiar_al_portapapeles,
-    "crear_temporizador": sistema.crear_temporizador,
-    "listar_temporizadores": sistema.listar_temporizadores,
-    "cancelar_temporizadores": sistema.cancelar_temporizadores,
-    "optimizar_pc": sistema.optimizar_pc,
-    "plan_de_energia": sistema.plan_de_energia,
-}
+class _VistaHerramientas(dict):
+    """Vista de solo lectura {nombre: función} sobre el registro, incluidas las MCP que lleguen después."""
 
-# Nombres que un modelo pequeño suele inventar → herramienta real.
-SINONIMOS_HERRAMIENTAS = {
-    "abrir_app": "abrir_aplicacion", "abrir_programa": "abrir_aplicacion", "open_app": "abrir_aplicacion",
-    "abrir_aplicaciones": "abrir_aplicacion", "iniciar_aplicacion": "abrir_aplicacion",
-    "cerrar_app": "cerrar_aplicacion", "cerrar_programa": "cerrar_aplicacion",
-    "buscar_aplicacion": "listar_aplicaciones_instaladas", "buscar_app": "listar_aplicaciones_instaladas",
-    "subir_volumen": "controlar_volumen", "bajar_volumen": "controlar_volumen", "volumen": "controlar_volumen",
-    "temporizador": "crear_temporizador", "recordatorio": "crear_temporizador", "bateria": "estado_bateria",
-}
+    def __getitem__(self, nombre):
+        return REGISTRO.herramientas[nombre].funcion
 
-# Acciones que SIEMPRE requieren permiso explicito del usuario antes de ejecutarse
-ACCIONES_SENSIBLES = {
-    "eliminar_archivo",
-    "escribir_archivo",
-    "convertir_documento",
-    "tomar_captura_pantalla",
-    "descargar_video",
-    "ejecutar_script_python",
-    "cerrar_aplicacion",
-    "desactivar_elemento_inicio",
-    "limpiar_temporales_usuario",
-    "liberar_ram_avanzada",
-    "reemplazar_texto_archivo",
-    "apagar_pc",
-    "reiniciar_pc",
-    "suspender_pc",
-    "optimizar_pc",
-    "plan_de_energia",
-}
+    def __contains__(self, nombre):
+        return nombre in REGISTRO.herramientas
+
+    def __iter__(self):
+        return iter(list(REGISTRO.herramientas))
+
+    def __len__(self):
+        return len(REGISTRO.herramientas)
+
+    def keys(self):
+        return list(REGISTRO.herramientas)
+
+    def items(self):
+        return [(n, h.funcion) for n, h in REGISTRO.herramientas.items()]
+
+    def get(self, nombre, defecto=None):
+        return self[nombre] if nombre in self else defecto
+
+
+HERRAMIENTAS_DISPONIBLES = _VistaHerramientas()
+
+# Herramientas que siempre se ofrecen al modelo, pida lo que pida el usuario.
+HERRAMIENTAS_BASE = ("abrir_aplicacion", "abrir_en_navegador", "buscar_informacion", "buscar_herramientas")
+HERRAMIENTAS_INGENIERIA = ("explorar_proyecto", "leer_archivo_codigo", "reemplazar_texto_archivo", "verificar_archivo_python")
+MAX_HERRAMIENTAS_PROMPT = 12
+MAX_OBSERVACIONES = 3  # reintentos tras una herramienta inexistente o buscar_herramientas
+# Órdenes cuyo texto describe a otra persona o es contenido dictado, no un dato del usuario.
+_SIN_RECUERDO = {"guardar_contacto", "enviar_whatsapp", "redactar_correo", "crear_nota", "agregar_pendiente",
+                 "agregar_evento", "copiar_al_portapapeles", "escribir_texto"}
 
 # Puede ser reemplazado por una interfaz grafica o de voz. Mantenerlo aqui
 # evita que el nucleo dependa de input(), que bloquea una futura UI.
@@ -213,111 +201,11 @@ def _cargar_personalidad() -> str:
         return "Eres Bark, un asistente de IA útil y directo."
 
 
-def _construir_system_prompt_completo() -> str:
-    personalidad = _cargar_personalidad()
-
-    return f"""{personalidad}
-
-FORMATO DE RESPUESTA:
-Debes responder SIEMPRE con un JSON, sin texto antes ni despues. Dos formatos posibles:
-
-1. Para platicar, responder preguntas, o pedir un dato que falta:
-{{"tipo": "respuesta_final", "mensaje": "tu respuesta aqui"}}
-
-2. Para ejecutar una herramienta:
-{{"tipo": "accion", "herramienta": "nombre_herramienta", "parametros": {{...}}}}
-
-HERRAMIENTAS DISPONIBLES:
-- abrir_aplicacion(nombre_app): abre programas instalados usando protocolo, registro, Inicio, Escritorio, carpeta conocida o PATH
-- abrir_ubicacion(ruta): abre una carpeta o archivo existente sin modificarlo
-- buscar_y_abrir_aplicacion(nombre): busca accesos en Escritorio y menú Inicio, y abre solo una coincidencia inequívoca
-- listar_aplicaciones_instaladas(consulta): lista programas detectados en Registro, Inicio y Escritorio; consulta es opcional para filtrar
-- listar_juegos_instalados(): busca juegos y launchers en Inicio, Escritorio y aplicaciones registradas de Windows
-- cerrar_aplicacion(nombre_app): resuelve y cierra una aplicación/proceso activo (requiere permiso porque puede perder trabajo sin guardar)
-- diagnosticar_equipo(): revisa RAM, disco y cantidad de procesos sin modificar la PC
-- diagnosticar_ram_avanzado(): muestra los procesos con mayor consumo de RAM sin modificarlos
-- liberar_ram_avanzada(): recorta memoria residente de procesos accesibles sin cerrarlos; requiere permiso
-- listar_elementos_inicio(): muestra programas y tareas que se lanzan al encender o iniciar sesión, sin modificar nada
-- desactivar_elemento_inicio(nombre): desactiva una sola entrada de inicio identificada; no desinstala la app y requiere permiso
-- resumen_optimizacion(): analiza RAM, disco, temporales y el número de elementos de inicio sin modificar la PC
-- limpiar_temporales_usuario(): limpia solamente archivos temporales del usuario; requiere permiso
-- explorar_proyecto(ruta, profundidad): lista la estructura del proyecto local antes de editar
-- leer_archivo_codigo(ruta): lee un archivo de código o configuración dentro del proyecto
-- reemplazar_texto_archivo(ruta, buscar, reemplazar): modifica un bloque exacto una sola vez; requiere permiso
-- verificar_archivo_python(ruta): comprueba la sintaxis de un archivo Python sin ejecutarlo
-- crear_carpeta(ruta): crea una carpeta
-- listar_archivos(ruta): lista contenido de una carpeta
-- buscar_archivos_locales(consulta, fecha): busca documentos por nombre o fecha y ofrece opciones numeradas
-- abrir_archivo_encontrado(indice): abre una opción de la última búsqueda de archivos
-- convertir_documento(ruta, formato_destino): convierte DOCX a PDF o PDF a DOCX (requiere permiso porque crea un archivo)
-- eliminar_archivo(ruta_archivo): borra un archivo (requiere permiso)
-- escribir_archivo(ruta_archivo, contenido): crea/sobrescribe un archivo
-- buscar_informacion(query): busca en internet, resultados breves
-- extraer_texto_pagina(url): extrae texto de una URL especifica
-- abrir_en_navegador(url): abre una URL en el navegador (requiere una URL real, nunca vacia)
-- leer_documento(ruta): lee texto de un .txt, .pdf o .docx
-- crear_documento_word(ruta_archivo, titulo, contenido, referencias): crea un .docx local
-- investigar_y_crear_word(tema, ruta_archivo): busca fuentes web y crea un .docx con extractos y referencias
-- tomar_captura_pantalla(): toma una captura de pantalla
-- descargar_video(url, solo_audio): descarga de YouTube (requiere permiso)
-- ejecutar_script_python(ruta_script): ejecuta un script en la sandbox (requiere permiso)
-- cerrar_pestana_navegador(): cierra la pestaña activa del navegador (Ctrl+W)
-- controlar_spotify(accion): controla reproduccion. accion = "play_pausa", "siguiente" o "anterior"
-- buscar_y_reproducir_spotify(cancion): abre Spotify y busca una cancion
-- buscar_canciones(consulta): muestra opciones de canciones para elegir por número o artista
-- reproducir_cancion_encontrada(indice, artista): reproduce una canción de la última lista de opciones
-- crear_carpeta_resultados(nombre_tarea): crea una carpeta "Resultados_X" en el escritorio para guardar ahi archivos de una tarea
-- consultar_memoria(consulta): consulta recuerdos personales relevantes ya guardados localmente
-- consultar_biblioteca(periodo, consulta): muestra conversaciones guardadas. periodo = "hoy", "semana" o "todo"
-
-LIMITACIONES REALES (se honesto sobre esto, nunca finjas que si puedes):
-- No puedes saber cual pestaña especifica esta abierta ni su titulo, solo puedes cerrar "la pestaña activa" con cerrar_pestana_navegador.
-- No puedes generar archivos PDF directamente ni imagenes. Si puedes crear archivos Word .docx con crear_documento_word.
-- Si el usuario pide algo que ninguna herramienta de la lista puede hacer, responde con respuesta_final explicando honestamente que no tienes esa capacidad todavia. NUNCA digas que ya lo hiciste si no existe la herramienta.
-
-EJEMPLOS:
-
-Usuario: "hola"
-Respuesta: {{"tipo": "respuesta_final", "mensaje": "Hola, ¿en que puedo ayudarte?"}}
-
-Usuario: "abre el navegador"
-Respuesta: {{"tipo": "respuesta_final", "mensaje": "¿Que pagina quieres que abra?"}}
-
-Usuario: "abre google"
-Respuesta: {{"tipo": "accion", "herramienta": "abrir_en_navegador", "parametros": {{"url": "https://www.google.com"}}}}
-
-Usuario: "abre Roblox Player"
-Respuesta: {{"tipo": "accion", "herramienta": "abrir_aplicacion", "parametros": {{"nombre_app": "roblox player"}}}}
-
-Usuario: "cierra esa pestaña"
-Respuesta: {{"tipo": "respuesta_final", "mensaje": "Solo puedo enviar Ctrl+W a la pestaña activa; no puedo listar ni identificar las pestañas reales del navegador. ¿Confirmas que cierre la pestaña activa?"}}
-
-Usuario: "pon musica en spotify"
-Respuesta: {{"tipo": "respuesta_final", "mensaje": "¿Que cancion o artista quieres que busque?"}}
-
-Usuario: "pon algo de queen"
-Respuesta: {{"tipo": "accion", "herramienta": "buscar_y_reproducir_spotify", "parametros": {{"cancion": "queen"}}}}
-
-Usuario: "pausa la musica"
-Respuesta: {{"tipo": "accion", "herramienta": "controlar_spotify", "parametros": {{"accion": "play_pausa"}}}}
-
-IMPORTANTE SOBRE SPOTIFY: Nunca uses "siguiente" para una solicitud de cancion. Usa buscar_y_reproducir_spotify(cancion). Las teclas multimedia solo envian el comando; nunca afirmes que la musica realmente se reprodujo o pauso.
-
-Usuario: "investiga sobre pinguinos en formato APA y Word"
-Respuesta: {{"tipo": "accion", "herramienta": "investigar_y_crear_word", "parametros": {{"tema": "pingüinos", "ruta_archivo": "resultados/investigacion_pinguinos.docx"}}}}
-
-Usuario: "investiga sobre pinguinos y dame un pdf"
-Respuesta: {{"tipo": "respuesta_final", "mensaje": "Puedo investigar sobre pinguinos y guardarte un resumen en texto dentro de una carpeta de resultados, pero todavia no puedo generar archivos PDF. ¿Quieres que lo guarde como archivo de texto en su lugar?"}}
-
-REGLA CRITICA: Nunca respondas texto plano fuera del JSON. Nunca digas que ya ejecutaste algo si no generaste la accion correspondiente. Tras una accion, el programa mostrara el resultado REAL de la herramienta y terminara el turno: no intentes describir, completar ni inventar el resultado. Si dudas si algo es una accion o platica, prefiere responder con respuesta_final y preguntar.
-"""
-
-
 def _construir_system_prompt() -> str:
-    """Prompt breve: los comandos frecuentes ya se resuelven sin LLM.
+    """Prompt breve y fijo: los comandos frecuentes ya se resuelven sin LLM.
 
-    Reducir miles de caracteres de instrucciones baja de forma notable el
-    tiempo hasta el primer token en CPU y deja al modelo para razonamiento.
+    Es idéntico en cada turno para que llama.cpp reutilice su caché de prefijo;
+    la lista de herramientas, que sí cambia, va en un mensaje aparte.
     """
     personalidad = (
         "Eres Bark, asistente local de escritorio. Habla español, directo y honesto. "
@@ -331,16 +219,26 @@ Responde SOLO JSON válido: {{"tipo":"respuesta_final","mensaje":"..."}} o
 {{"tipo":"accion","herramienta":"...","parametros":{{...}}}}.
 No inventes; pregunta si falta dato.
 
-Usa exactamente uno de estos nombres de herramienta, nunca categorías: abrir_aplicacion, listar_aplicaciones_instaladas,
-cerrar_aplicacion, abrir_ubicacion, listar_archivos, buscar_archivos_locales, leer_documento, escribir_archivo,
-eliminar_archivo, diagnosticar_equipo, diagnosticar_ram_avanzado, liberar_ram_avanzada, listar_elementos_inicio,
-desactivar_elemento_inicio, resumen_optimizacion, limpiar_temporales_usuario, explorar_proyecto, leer_archivo_codigo,
-reemplazar_texto_archivo, verificar_archivo_python, buscar_informacion, abrir_en_navegador, extraer_texto_pagina,
-crear_documento_word, convertir_documento, abrir_configuracion, controlar_volumen, fijar_volumen, fijar_brillo,
-estado_bateria, optimizar_pc, plan_de_energia(modo), bloquear_pc, minimizar_todo, apagar_pc, reiniciar_pc, suspender_pc, cancelar_apagado,
-listar_ventanas_abiertas, enfocar_ventana, leer_portapapeles, copiar_al_portapapeles, crear_temporizador(minutos,mensaje).
-Para abrir cualquier programa usa abrir_aplicacion con el nombre hablado tal cual (ya entiende sinónimos y apps de la Tienda).
-Para código: explora primero; luego leer_archivo_codigo(ruta), reemplazar_texto_archivo(ruta,buscar,reemplazar) y verificar_archivo_python(ruta). Confirma acciones sensibles."""
+Usa solo herramientas de la lista HERRAMIENTAS que llega después, con su nombre exacto.
+Si ninguna encaja, llama buscar_herramientas(consulta) antes de rendirte; si tampoco hay, dilo con honestidad.
+Los nombres aproximados están bien (apps, archivos, carpetas, contactos, redes Wi-Fi, sitios): Bark busca el más parecido.
+Para abrir cualquier programa usa abrir_aplicacion con el nombre hablado tal cual.
+Las herramientas marcadas [pide permiso] preguntan solas al usuario; no pidas confirmación tú."""
+
+
+def _herramientas_para(mensaje: str, contexto: str = "", modo_ingenieria: bool = False) -> list:
+    """Elige las herramientas relevantes para este turno (como la búsqueda de herramientas de Claude)."""
+    elegidas = [REGISTRO.obtener(n) for n in HERRAMIENTAS_BASE]
+    if modo_ingenieria:
+        elegidas += [REGISTRO.obtener(n) for n in HERRAMIENTAS_INGENIERIA]
+    for h in REGISTRO.buscar(mensaje, limite=MAX_HERRAMIENTAS_PROMPT) + REGISTRO.buscar(contexto, limite=3):
+        elegidas.append(h)
+    unicas = {h.nombre: h for h in elegidas if h is not None and not REGISTRO.disponible(h)}
+    return list(unicas.values())[: MAX_HERRAMIENTAS_PROMPT + len(HERRAMIENTAS_BASE)]
+
+
+def _mensaje_herramientas(mensaje: str, contexto: str = "", modo_ingenieria: bool = False) -> str:
+    return "HERRAMIENTAS:\n" + REGISTRO.catalogo(_herramientas_para(mensaje, contexto, modo_ingenieria))
 
 
 def _formatear_recuerdos(consulta: str = "", incluir_sensibles: bool = False) -> str:
@@ -357,6 +255,23 @@ def _formatear_biblioteca(periodo: str = "hoy", consulta: str = "") -> str:
     return "\n\n".join(
         f"[{turno['creado_en']}]\nTú: {turno['usuario']}\nBark: {turno['chet']}" for turno in turnos
     )
+
+
+def consultar_memoria(consulta: str = "") -> str:
+    return _formatear_recuerdos(consulta, incluir_sensibles=True)
+
+
+def consultar_biblioteca(periodo: str = "hoy", consulta: str = "") -> str:
+    return _formatear_biblioteca(periodo, consulta)
+
+
+REGISTRO.registrar_funcion(consultar_memoria, "memoria", "Consulta recuerdos personales guardados localmente",
+                           palabras=("recuerdas", "memoria", "recuerdos", "sabes de mi"))
+REGISTRO.registrar_funcion(consultar_biblioteca, "memoria", "Conversaciones guardadas; periodo = hoy, semana o todo",
+                           palabras=("historial", "conversaciones", "hablamos"))
+
+# Compatibilidad: el permiso real lo decide la marca «sensible» de cada herramienta.
+ACCIONES_SENSIBLES = {n for n, h in REGISTRO.herramientas.items() if h.sensible}
 
 
 def _detectar_recuerdo(mensaje: str) -> tuple[str, str] | None:
@@ -440,7 +355,9 @@ def _respuesta_directa(mensaje: str) -> str | None:
     if texto in {"gracias", "muchas gracias", "gracias bark"}:
         return "De nada."
     if texto in {"que puedes hacer", "ayuda", "que sabes hacer"}:
-        return "Puedo abrir programas y ubicaciones, buscar archivos, controlar música, crear documentos, usar memoria y responder preguntas. Di, por ejemplo: “abre Discord”, “busca tarea de ayer” o “reproduce Zoé”."
+        return ("Tengo conectores para apps, archivos, documentos, música, red y Wi-Fi, instalar programas, notas, "
+                "pendientes, agenda, contactos y WhatsApp, clima, divisas, noticias, Git y servidores MCP. "
+                "Prueba: “abre Discord”, “qué clima hace mañana”, “anota comprar tortillas” o “qué conectores tienes”.")
     if texto in {"que hora es", "dime la hora", "hora"}:
         return f"Son las {datetime.now().strftime('%H:%M')}."
     if texto in {"que fecha es", "fecha", "que dia es", "que dia es hoy"}:
@@ -576,6 +493,182 @@ def _accion_sistema(mensaje: str, texto: str):
     return None
 
 
+_MONEDAS_HABLADAS = r"(dolar(?:es)?|euros?|pesos?(?: mexicanos?| colombianos?| argentinos?| chilenos?)?|yen(?:es)?|libras?|reales?|yuan(?:es)?|quetzal(?:es)?)"
+_CANTIDAD = r"(\d+(?:[.,]\d+)?)"
+
+
+def _original(mensaje: str, texto: str, coincidencia, grupo: int = 1) -> str:
+    """Recupera un fragmento con mayúsculas y acentos originales: al quitar acentos el largo no cambia."""
+    valor = coincidencia.group(grupo) or ""
+    if len(mensaje) == len(texto):
+        return mensaje[coincidencia.start(grupo):coincidencia.end(grupo)].strip(" .,")
+    return valor.strip(" .,")
+
+
+def _accion_conectores(mensaje: str, texto: str):
+    """Órdenes de los conectores nuevos que no necesitan pasar por el LLM."""
+    # Whisper suele añadir «¿…?» o un punto final; se quitan de ambos para que los índices coincidan.
+    mensaje = mensaje.strip(" .,;!?¿¡\n\t")
+    texto = _normalizar(mensaje)
+
+    # Núcleo
+    if re.search(r"\b(?:conectores|integraciones)\b", texto) and re.search(r"\b(?:que|cuales|muestra|lista|ver|tus|mis)\b", texto):
+        return "listar_conectores", {}
+    if re.search(r"\b(?:recarga|reconecta|actualiza)\b.*\b(?:conectores|mcp)\b", texto):
+        return "recargar_conectores_mcp", {}
+
+    # Clima
+    if re.search(r"\b(?:clima|pronostico|va a llover|llovera|hara (?:frio|calor)|que temperatura hace)\b|\bque tiempo hace\b", texto) \
+            and not re.search(r"\b(?:cpu|procesador|gpu|pc|compu)\b", texto):
+        dia = "pasado manana" if "pasado manana" in texto else "manana" if re.search(r"\bmanana\b", texto) else "hoy"
+        lugar = re.search(r"\b(?:en|de|para)\s+(?!hoy\b|manana\b|pasado\b|la semana\b)([a-z][a-z .]{2,40}?)(?:\s+(?:hoy|manana|pasado manana|ahorita|ahora))?\s*$", texto)
+        return "clima", {"ciudad": _original(mensaje, texto, lugar) if lugar else "", "dia": dia}
+
+    # Divisas (antes que unidades: «100 dólares a pesos»)
+    divisa = re.search(rf"{_CANTIDAD}\s*{_MONEDAS_HABLADAS}\s+(?:a|en)\s+{_MONEDAS_HABLADAS}", texto)
+    if divisa:
+        return "tipo_de_cambio", {"de": divisa.group(2), "a": divisa.group(3), "cantidad": float(divisa.group(1).replace(",", "."))}
+    precio = re.search(rf"\b(?:tipo de cambio(?: del?)?|a como (?:esta|anda) el|cuanto (?:esta|vale|cuesta) el|precio del)\s+{_MONEDAS_HABLADAS}", texto)
+    if precio:
+        return "tipo_de_cambio", {"de": precio.group(1), "a": "MXN", "cantidad": 1}
+
+    # Unidades
+    unidades = re.search(rf"^(?:convierte|pasa|cuanto es|cuantos son|cuantas son)\s+{_CANTIDAD}\s*([a-z°/ ]+?)\s+(?:a|en)\s+([a-z°/ ]+)$", texto)
+    if unidades:
+        return "convertir_unidades", {"cantidad": float(unidades.group(1).replace(",", ".")), "de": unidades.group(2), "a": unidades.group(3)}
+    unidades = re.search(rf"^cuant[oa]s\s+([a-z/ ]+?)\s+(?:son|hay en|tiene)\s+{_CANTIDAD}\s*([a-z°/ ]+)$", texto)
+    if unidades:
+        return "convertir_unidades", {"cantidad": float(unidades.group(2).replace(",", ".")), "de": unidades.group(3), "a": unidades.group(1)}
+
+    # Red
+    if re.search(r"\bmi ip\b|\bip publica\b", texto):
+        return ("ip_publica", {}) if re.search(r"\bpublica\b|\bexterna\b", texto) else ("estado_red", {})
+    if re.search(r"\b(?:tengo|hay|estoy sin|no tengo|no hay)\s+(?:internet|conexion|red)\b|\bestoy conectado\b|\bestado de (?:la )?red\b", texto):
+        return "estado_red", {}
+    ping = re.search(r"\b(?:haz(?:me|le)?\s+)?(?:un\s+)?ping\s+(?:a\s+)?([a-z0-9.\-]+\.[a-z]{2,}|\d{1,3}(?:\.\d{1,3}){3})\b", texto)
+    if ping:
+        return "hacer_ping", {"host": ping.group(1)}
+    if re.search(r"\bredes?\b.*\b(?:wifi|wi fi|inalambricas?)\b|\b(?:wifi|wi fi)\b.*\b(?:disponibles?|cerca|hay)\b", texto) \
+            and not re.search(r"\bconecta", texto):
+        return "redes_wifi", {}
+    wifi = re.fullmatch(r"(?:conectate|conecta(?:me)?(?: la pc)?)\s+(?:a|al)\s+(?:la\s+)?(?:red|wifi|wi fi|internet)?\s*(?:de\s+)?(.+)", texto)
+    if wifi and wifi.group(1).strip() not in {"internet", "red", "wifi"}:
+        return "conectar_wifi", {"nombre": _original(mensaje, texto, wifi)}
+    if re.search(r"\bbluetooth\b", texto) and re.search(r"\b(?:dispositivos|emparejados|conectados|que tengo)\b", texto):
+        return "dispositivos_bluetooth", {}
+
+    # Programas (winget)
+    instala = re.fullmatch(r"(?:instala(?:me|le)?|descarga(?:me)? e instala)\s+(?:el programa |la app |la aplicacion |el juego )?(.+)", texto)
+    if instala:
+        return "instalar_programa", {"nombre": _original(mensaje, texto, instala)}
+    desinstala = re.fullmatch(r"(?:desinstala(?:me|le)?)\s+(?:el programa |la app |la aplicacion |el juego )?(.+)", texto)
+    if desinstala:
+        return "desinstalar_programa", {"nombre": _original(mensaje, texto, desinstala)}
+    if re.search(r"\bactualiza(?:r)?\s+(?:todos\s+)?(?:mis\s+|los\s+)?(?:programas|apps|aplicaciones)\b|\bactualiza todo\b", texto):
+        return "actualizar_programas", {"nombre": ""}
+    if re.search(r"\b(?:que|cuales)\s+(?:programas|apps|aplicaciones)\b.*\bactualiza|\bhay actualizaciones\b|\bactualizaciones pendientes\b", texto):
+        return "listar_actualizaciones", {}
+
+    # Información del equipo
+    if re.search(r"\b(?:especificaciones|specs|que procesador|que tarjeta (?:de video|grafica)|que grafica|cuanta ram tengo|"
+                 r"caracteristicas de (?:mi|la) (?:pc|compu|computadora|laptop)|que (?:pc|computadora|laptop) tengo)\b", texto):
+        return "info_sistema", {}
+    if re.search(r"\buso de (?:la )?(?:cpu|procesador)\b|\bque tan (?:cargada|ocupada)\b|\bcuanto (?:cpu|procesador) (?:uso|usa|ocupa)\b", texto):
+        return "uso_recursos", {}
+    if re.search(r"\b(?:que\s+)?procesos\s+(?:hay\s+)?(?:abiertos|activos|corriendo)\b|\bque procesos\b", texto):
+        return "listar_procesos", {}
+    if re.search(r"\bcuanto tiempo lleva (?:encendida|prendida|encendido|prendido)\b", texto):
+        return "tiempo_encendido", {}
+    if re.search(r"\bcuanto espacio\b|\bespacio (?:libre|en (?:el |mi )?disco)\b|\bdisco (?:lleno|duro)\b", texto) \
+            and not re.search(r"\blibera\b", texto):
+        return "espacio_en_disco", {}
+
+    # Recordatorio a una hora concreta («recuérdame a las 5 que…»)
+    hora = re.search(r"\b(?:recuerdame|avisame|alarma|despiertame|alertame)\b.*?\ba las?\s+"
+                     r"(\d{1,2}(?:[: ]\d{2})?(?:\s*(?:am|pm|a m|p m))?(?:\s+y\s+(?:media|cuarto))?(?:\s+de la (?:manana|tarde|noche))?)"
+                     r"(?:\s+(?:que|para|de que)\s+(.+))?\s*$", texto)
+    if hora:
+        aviso = _original(mensaje, texto, hora, 2) if hora.group(2) else ""
+        return "recordatorio_a_las", {"hora": hora.group(1), "mensaje": f"Recordatorio: {aviso}" if aviso else ""}
+
+    # Pendientes (antes que notas: «apunta en pendientes…»)
+    pendiente = re.fullmatch(r"(?:agrega|anade|pon|apunta|mete)\s+(?:a|en)\s+(?:mis\s+|los\s+|la lista de\s+)?(?:pendientes|tareas por hacer|to do)\s*[:,]?\s*(?:que\s+)?(.+)", texto) \
+        or re.fullmatch(r"(?:agrega|anade|apunta)\s+(?:el |un |como )?pendiente\s*[:,]?\s*(?:que\s+)?(.+)", texto)
+    if pendiente:
+        return "agregar_pendiente", {"tarea": _original(mensaje, texto, pendiente)}
+    if re.search(r"\b(?:mis pendientes|que (?:tengo )?pendientes?|que tengo pendiente|lista de pendientes|que me falta hacer)\b", texto):
+        return "listar_pendientes", {}
+    hecho = re.fullmatch(r"(?:ya\s+(?:termine|hice|acabe)|marca como (?:hecho|hecha|terminado|terminada)|tacha)\s+(?:el pendiente\s+)?(.+)", texto)
+    if hecho:
+        return "completar_pendiente", {"tarea": _original(mensaje, texto, hecho)}
+
+    # Notas
+    nota = re.fullmatch(r"(?:anota(?:me)?|apunta(?:me)?|toma nota(?: de)?|crea una nota|guarda una nota|nota)\s*[:,]?\s*(?:que\s+)?(.+)", texto)
+    if nota and len(nota.group(1)) >= 2:
+        return "crear_nota", {"texto": _original(mensaje, texto, nota)}
+    if re.search(r"\b(?:mis notas|lee mis notas|muestra(?:me)? (?:mis )?notas|que notas tengo|que anote)\b", texto):
+        return "listar_notas", {}
+
+    # Agenda
+    if re.search(r"\b(?:proximos eventos|mi semana|que tengo esta semana|agenda de la semana)\b", texto):
+        return "proximos_eventos", {}
+    agenda = re.fullmatch(r"(?:que tengo|mi agenda|que hay en mi agenda|eventos)\s+(?:para\s+|de\s+)?(hoy|manana|pasado manana|el \w+|este \w+)(?:\s+en (?:la|mi) agenda)?", texto)
+    if agenda:
+        return "eventos_de", {"fecha": agenda.group(1)}
+
+    # Contactos y mensajes
+    contacto = re.fullmatch(r"guarda(?:r)?\s+(?:a\s+|el contacto(?: de)?\s+)(.+?)\s+con\s+(?:el\s+)?(numero|telefono|cel(?:ular)?|correo|email)\s+(.+)", texto)
+    if contacto:
+        nombre = _original(mensaje, texto, contacto, 1)
+        dato = _original(mensaje, texto, contacto, 3)
+        if contacto.group(2) in {"correo", "email"}:
+            return "guardar_contacto", {"nombre": nombre, "correo": dato}
+        return "guardar_contacto", {"nombre": nombre, "telefono": dato}
+    whats = re.fullmatch(r"(?:manda|envia|escribe)(?:le)?\s+(?:un\s+)?(?:whats(?:app)?|wasap|wats|mensaje(?: de whatsapp| por whatsapp)?)\s+a\s+(.+?)\s+(?:que diga|diciendo|que|:)\s*(.+)", texto)
+    if whats:
+        return "enviar_whatsapp", {"contacto": _original(mensaje, texto, whats, 1), "mensaje": _original(mensaje, texto, whats, 2)}
+    chat = re.fullmatch(r"abre (?:el\s+)?(?:whatsapp|chat|whats)\s+de\s+(.+)", texto)
+    if chat:
+        return "enviar_whatsapp", {"contacto": _original(mensaje, texto, chat), "mensaje": ""}
+    correo = re.fullmatch(r"(?:manda|envia|escribe|redacta)(?:le)?\s+un\s+(?:correo|mail|email)\s+a\s+(.+?)\s+(?:que diga|diciendo|que|sobre|:)\s*(.+)", texto)
+    if correo:
+        cuerpo = _original(mensaje, texto, correo, 2)
+        return "redactar_correo", {"destinatario": _original(mensaje, texto, correo, 1),
+                                   "asunto": " ".join(cuerpo.split()[:7]), "cuerpo": cuerpo}
+
+    # Archivos y carpetas por nombre aproximado
+    if not re.search(r"\s(?:de|del)\s+(?:hoy|ayer|\d{1,2}[/-])", texto):
+        archivo = re.fullmatch(r"(?:busca(?:me)?|encuentra(?:me)?|donde (?:esta|quedo|estan))\s+(?:el |la |mi |mis |los |las )?(archivo|carpeta|documento)s?\s+(?:de |llamad[oa] |que se llama )?(.+)", texto)
+        if archivo:
+            return "buscar_archivo_parecido", {"nombre": _original(mensaje, texto, archivo, 2), "solo_carpetas": archivo.group(1) == "carpeta"}
+    carpeta = re.fullmatch(r"(?:abre|abreme|ve a|entra a)\s+(?:la |mi )?carpeta\s+(?:de |del |llamada )?(.+)", texto)
+    if carpeta:
+        return "abrir_carpeta", {"nombre": _original(mensaje, texto, carpeta)}
+    if re.search(r"\b(?:archivos recientes|ultimos archivos|que archivos (?:use|abri|modifique|edite))\b", texto):
+        return "archivos_recientes", {}
+
+    # Web: noticias, Wikipedia y búsquedas en sitios
+    noticias = re.fullmatch(r"(?:dame |dime |cuales son |muestrame |que )?(?:las )?(?:ultimas )?(?:noticias|titulares)(?: de hoy)?(?:\s+(?:de|sobre|del)\s+(.+))?", texto)
+    if noticias:
+        return "noticias", {"tema": _original(mensaje, texto, noticias) if noticias.group(1) else ""}
+    wiki = re.fullmatch(r"(?:busca en wikipedia|wikipedia|definicion de|que significa)\s+(.+)", texto)
+    if wiki:
+        return "definir", {"tema": _original(mensaje, texto, wiki)}
+    en_sitio = re.fullmatch(r"busca(?:me)?\s+(.+?)\s+en\s+(amazon|mercado libre|maps|google maps|github|wikipedia|tiktok|pinterest|"
+                            r"spotify|imagenes|reddit|twitch|netflix|stack overflow)", texto)
+    if en_sitio:
+        return "buscar_en_sitio", {"consulta": _original(mensaje, texto, en_sitio, 1), "sitio": en_sitio.group(2)}
+    mapa = re.fullmatch(r"(?:donde queda|como llego a|ubicacion de)\s+(.+)", texto)
+    if mapa:
+        return "buscar_en_sitio", {"consulta": _original(mensaje, texto, mapa), "sitio": "Google Maps"}
+
+    # Atajos de teclado explícitos
+    atajo = re.fullmatch(r"(?:presiona|pulsa|aprieta)\s+(?:las teclas\s+|la tecla\s+|el atajo\s+)?(.+)", texto)
+    if atajo:
+        return "presionar_atajo", {"atajo": atajo.group(1)}
+    return None
+
+
 def _accion_directa(mensaje: str):
     """Atajos deterministas para controles comunes que un LLM pequeño confunde."""
     texto = _normalizar(mensaje).strip()
@@ -601,6 +694,9 @@ def _accion_directa(mensaje: str):
     accion_sistema = _accion_sistema(mensaje, texto)
     if accion_sistema:
         return accion_sistema
+    accion_conector = _accion_conectores(mensaje, texto)
+    if accion_conector:
+        return accion_conector
     if texto in {"abre el navegador", "abre navegador", "abre internet"}:
         return "abrir_en_navegador", {"url": "https://www.google.com"}
 
@@ -825,7 +921,8 @@ def procesar_mensaje(mensaje_usuario: str, max_iteraciones: int = None) -> str:
     accion = _accion_directa(mensaje_usuario)
     if accion:
         resultado = _ejecutar_herramienta(*accion)
-        aviso_recuerdo = _guardar_recuerdo_si_corresponde(mensaje_usuario)
+        # Un contacto, nota o mensaje dictado habla de otros: no es un recuerdo sobre el usuario.
+        aviso_recuerdo = None if accion[0] in _SIN_RECUERDO else _guardar_recuerdo_si_corresponde(mensaje_usuario)
         if aviso_recuerdo:
             resultado = f"{resultado}\n{aviso_recuerdo}"
         historial_sesion.agregar_turno(mensaje_usuario, resultado, sensible=mensaje_sensible)
@@ -840,19 +937,22 @@ def procesar_mensaje(mensaje_usuario: str, max_iteraciones: int = None) -> str:
         r"\b(?:codigo|código|programa|proyecto|python|archivo|bug|error|funcion|función|refactor|interfaz)\b",
         _normalizar(mensaje_usuario),
     ))
-    herramientas_ingenieria = {
-        "explorar_proyecto", "leer_archivo_codigo", "reemplazar_texto_archivo", "verificar_archivo_python",
-    }
+    herramientas_ingenieria = set(HERRAMIENTAS_INGENIERIA)
 
-    mensajes = [{"role": "system", "content": _construir_system_prompt()}]
+    contexto_previo = historial_sesion.obtener_mensajes_contexto(incluir_sensibles=False)
+    ultimo_usuario = next((m["content"] for m in reversed(contexto_previo) if m["role"] == "user"), "")
+
+    mensajes = [{"role": "system", "content": _construir_system_prompt()},
+                {"role": "system", "content": _mensaje_herramientas(mensaje_usuario, ultimo_usuario, modo_ingenieria)}]
     # Al proveedor de nube solo se le dan recuerdos no sensibles y relevantes.
     recuerdos = _formatear_recuerdos(mensaje_usuario, incluir_sensibles=False)
     if not recuerdos.startswith("No hay"):
         mensajes.append({"role": "system", "content": f"MEMORIA PERSONAL RELEVANTE:\n{recuerdos}"})
     # El historial sensible no sale de Bark: ni siquiera cuando la consulta actual es inocua.
-    mensajes.extend(historial_sesion.obtener_mensajes_contexto(incluir_sensibles=False))
+    mensajes.extend(contexto_previo)
     mensajes.append({"role": "user", "content": mensaje_usuario})
 
+    observaciones = 0
     respuesta_final_texto = None
 
     for iteracion in range(limite):
@@ -881,22 +981,27 @@ def procesar_mensaje(mensaje_usuario: str, max_iteraciones: int = None) -> str:
             nombre_herramienta = decision.get("herramienta")
             parametros = decision.get("parametros", {})
 
-            resultado = _ejecutar_herramienta(nombre_herramienta, parametros)
-            if modo_ingenieria and nombre_herramienta in herramientas_ingenieria:
+            resultado = REGISTRO.ejecutar(nombre_herramienta, parametros, _solicitador_permiso)
+            # Vuelve al modelo cuando la herramienta no existía (con sugerencias), faltaban
+            # datos, era buscar_herramientas, o es un paso de una tarea de código.
+            encadenar = (resultado.observar and observaciones < MAX_OBSERVACIONES) or (
+                modo_ingenieria and resultado.herramienta in herramientas_ingenieria)
+            if encadenar:
+                observaciones += 1
                 mensajes.append({"role": "assistant", "content": respuesta_llm})
                 mensajes.append({
                     "role": "user",
                     "content": (
                         "OBSERVACIÓN REAL DE LA HERRAMIENTA:\n"
-                        f"{str(resultado)[:config.MAX_CARACTERES_OBSERVACION]}\n\n"
-                        "Continúa solo si hace falta inspeccionar, editar o verificar; "
-                        "de lo contrario responde con respuesta_final y resume el resultado."
+                        f"{resultado.texto[:config.MAX_CARACTERES_OBSERVACION]}\n\n"
+                        "Si ahora tienes la herramienta correcta, úsala con su nombre exacto. "
+                        "Continúa solo si hace falta; de lo contrario responde con respuesta_final y resume el resultado."
                     ),
                 })
                 continue
             # Un modelo pequeño no debe reinterpretar ni adornar el resultado
             # de una acción aislada. Mostrar el dato observado evita alucinaciones.
-            respuesta_final_texto = str(resultado)[:config.MAX_CARACTERES_OBSERVACION]
+            respuesta_final_texto = resultado.texto[:config.MAX_CARACTERES_OBSERVACION]
             break
 
         else:
@@ -951,57 +1056,21 @@ def _parsear_respuesta_json(texto: str):
 
 def _resolver_herramienta(nombre) -> str | None:
     """Corrige nombres casi correctos que genera un modelo pequeño («abrir_app»)."""
-    if nombre in HERRAMIENTAS_DISPONIBLES:
-        return nombre
-    if not isinstance(nombre, str):
-        return None
-    clave = _normalizar(nombre).strip().replace(" ", "_").replace("-", "_")
-    if clave in HERRAMIENTAS_DISPONIBLES:
-        return clave
-    if clave in SINONIMOS_HERRAMIENTAS:
-        return SINONIMOS_HERRAMIENTAS[clave]
-    cercano = difflib.get_close_matches(clave, list(HERRAMIENTAS_DISPONIBLES), n=1, cutoff=0.8)
-    return cercano[0] if cercano else None
+    return REGISTRO.resolver(nombre)[0]
 
 
 def _ajustar_parametros(funcion, parametros) -> dict:
-    """Si el modelo llama al parámetro con otro nombre («app» en vez de «nombre_app»), lo reasigna por posición."""
-    if not isinstance(parametros, dict):
-        return {}
-    try:
-        firma = inspect.signature(funcion).parameters
-    except (TypeError, ValueError):
-        return parametros
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in firma.values()):
-        return parametros
-    validos = {k: v for k, v in parametros.items() if k in firma}
-    sobrantes = [v for k, v in parametros.items() if k not in firma]
-    libres = [n for n in firma if n not in validos]
-    for nombre_param, valor in zip(libres, sobrantes):
-        validos[nombre_param] = valor
-    return validos
+    """Si el modelo llama al parámetro con otro nombre («app» en vez de «nombre_app»), lo reasigna."""
+    herramienta = next((h for h in REGISTRO.herramientas.values() if h.funcion is funcion), None)
+    if herramienta is None:
+        from conectores.registro import Herramienta
+        herramienta = Herramienta(getattr(funcion, "__name__", "f"), funcion, "", "nucleo")
+    return REGISTRO.ajustar_parametros(herramienta, parametros)
 
 
 def _ejecutar_herramienta(nombre: str, parametros: dict) -> str:
     """Ejecuta la herramienta solicitada, pidiendo permiso si es sensible."""
-    resuelto = _resolver_herramienta(nombre)
-    if resuelto is None:
-        return f"Herramienta '{nombre}' no existe. No finjas haberla ejecutado."
-    nombre = resuelto
-    parametros = _ajustar_parametros(HERRAMIENTAS_DISPONIBLES[nombre], parametros)
-
-    if nombre in ACCIONES_SENSIBLES:
-        descripcion = f"{nombre}({parametros})"
-        if not _solicitador_permiso(descripcion):
-            return "El usuario NO autorizo esta accion."
-
-    try:
-        funcion = HERRAMIENTAS_DISPONIBLES[nombre]
-        return funcion(**parametros)
-    except TypeError as e:
-        return f"Parametros incorrectos para '{nombre}': {e}"
-    except Exception as e:
-        return f"Error al ejecutar '{nombre}': {e}"
+    return REGISTRO.ejecutar(nombre, parametros, _solicitador_permiso).texto
 
 
 # --- Zona de pruebas ---
@@ -1045,5 +1114,6 @@ def _precalentar_modelo() -> None:
 def precalentar() -> None:
     """Prepara en segundo plano el índice de apps y (si hace falta) el modelo local."""
     apps.precalentar_indice()
+    conectores_mcp.conectar_en_segundo_plano()
     if _modelo_local_necesario():
         threading.Thread(target=_precalentar_modelo, name="bark-precalentar-llm", daemon=True).start()

@@ -11,7 +11,7 @@ bd_memoria/*
 resultados/*
 !resultados/.gitkeep
 tmp*/
-respaldo_antes_de_optimizar/
+respaldo_antes_de_*/
 
 # Modelos pesados: se descargan aparte (ver modelos/README.md)
 modelos/**/*.gguf
@@ -20,3 +20,6 @@ modelos/**/*.onnx.json
 modelos/**/*.task
 modelos/whisper/*
 !modelos/whisper/.gitkeep
+
+# Conectores MCP personales (pueden apuntar a tus carpetas o servicios)
+config/conectores_mcp.json

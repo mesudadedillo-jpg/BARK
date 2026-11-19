@@ -1,0 +1,25 @@
+{
+  "_ayuda": "Copia este archivo como conectores_mcp.json. Cada servidor MCP se vuelve un conector de Bark. Usa ${VARIABLE} para leer tokens desde .env; nunca los escribas aquí.",
+  "servidores": {
+    "archivos": {
+      "descripcion": "Leer y editar archivos dentro de Documentos (servidor oficial de MCP).",
+      "comando": "npx",
+      "argumentos": ["-y", "@modelcontextprotocol/server-filesystem", "C:/Users/TU_USUARIO/Documents"],
+      "confiables": ["read_text_file", "list_directory", "directory_tree", "search_files", "get_file_info", "list_allowed_directories"],
+      "activo": false
+    },
+    "github": {
+      "descripcion": "Repositorios, issues y pull requests de GitHub (servidor remoto oficial).",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "encabezados": {"Authorization": "Bearer ${GITHUB_TOKEN}"},
+      "activo": false
+    },
+    "fetch": {
+      "descripcion": "Descarga páginas web y las convierte a texto.",
+      "comando": "uvx",
+      "argumentos": ["mcp-server-fetch"],
+      "confiables": ["fetch"],
+      "activo": false
+    }
+  }
+}
