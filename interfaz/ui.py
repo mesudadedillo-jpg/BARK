@@ -144,6 +144,8 @@ class VentanaBark:
         self._boton(lateral, "Biblioteca", self._abrir_biblioteca).pack(fill="x", pady=4)
         self._boton(lateral, "Ver memoria", self._ver_memoria).pack(fill="x", pady=4)
         self._boton(lateral, "Diagnóstico del equipo", self._diagnostico).pack(fill="x", pady=4)
+        self._etiqueta_seccion(lateral, "CONECTORES")
+        self._boton(lateral, "Conectores y herramientas", self._abrir_conectores).pack(fill="x", pady=4)
         self._etiqueta_seccion(lateral, "OPTIMIZACIÓN LOCAL")
         self._boton(lateral, "Centro de optimización", self._abrir_centro_optimizacion).pack(fill="x", pady=4)
         self._boton(lateral, "Analizar consumo de RAM", lambda: self._enviar_consulta("Diagnóstico de RAM")).pack(fill="x", pady=4)
@@ -347,6 +349,87 @@ class VentanaBark:
         self._boton(acciones, "Programas de inicio", lambda: self._enviar_desde_centro(ventana, "Mostrar programas de inicio")).pack(side="left", padx=(0, 8))
         self._boton(acciones, "Limpiar temporales", lambda: self._enviar_desde_centro(ventana, "Limpiar temporales")).pack(side="left")
         analizar()
+
+    def _abrir_conectores(self):
+        """Panel tipo «conectores» de Claude: qué puede tocar Bark y con qué herramientas."""
+        from conectores import REGISTRO, mcp
+
+        ventana = tk.Toplevel(self.raiz)
+        ventana.title("Conectores · Bark")
+        ventana.geometry("820x600")
+        ventana.minsize(640, 460)
+        ventana.configure(bg=COLORES["fondo"])
+        cabecera = tk.Frame(ventana, bg=COLORES["panel"], padx=22, pady=18)
+        cabecera.pack(fill="x")
+        tk.Label(cabecera, text="CONECTORES", bg=COLORES["panel"], fg=COLORES["acento"], font=("Segoe UI", 15, "bold")).pack(anchor="w")
+        resumen = tk.Label(cabecera, bg=COLORES["panel"], fg=COLORES["suave"], font=("Segoe UI", 9))
+        resumen.pack(anchor="w", pady=(5, 0))
+
+        barra = tk.Frame(ventana, bg=COLORES["fondo"], padx=22, pady=12)
+        barra.pack(fill="x")
+        busqueda = tk.Entry(barra, bg=COLORES["panel2"], fg=COLORES["texto"], insertbackground=COLORES["acento"],
+                            relief="flat", font=("Segoe UI", 10))
+        busqueda.pack(side="left", fill="x", expand=True, ipady=7, padx=(0, 8))
+        visor = scrolledtext.ScrolledText(ventana, wrap="word", state="disabled", bg=COLORES["panel"], fg=COLORES["texto"],
+                                          relief="flat", font=("Segoe UI", 10), padx=15, pady=13)
+        visor.pack(fill="both", expand=True, padx=22, pady=(0, 20))
+        visor.tag_configure("titulo", foreground=COLORES["acento"], font=("Segoe UI", 11, "bold"))
+        visor.tag_configure("apagado", foreground=COLORES["suave"], font=("Segoe UI", 11, "bold"))
+        visor.tag_configure("suave", foreground=COLORES["suave"])
+        visor.tag_configure("herramienta", font=("Consolas", 9))
+
+        def escribir(bloques):
+            if not visor.winfo_exists():
+                return
+            visor.configure(state="normal")
+            visor.delete("1.0", "end")
+            for texto, etiqueta in bloques:
+                visor.insert("end", texto, *((etiqueta,) if etiqueta else ()))
+            visor.configure(state="disabled")
+
+        def mostrar(_evento=None):
+            consulta = busqueda.get().strip()
+            if consulta:
+                encontradas = REGISTRO.buscar(consulta, limite=15, solo_disponibles=False)
+                bloques = [(f"Herramientas para «{consulta}»\n\n", "titulo")]
+                bloques += [(f"{h.firma()}\n", "herramienta") for h in encontradas] or [("Ninguna coincide.\n", "suave")]
+                escribir(bloques)
+                return
+            estado = REGISTRO.estado()
+            listos = sum(1 for c in estado if c["disponible"])
+            resumen.config(text=f"{listos} de {len(estado)} conectores listos · {len(REGISTRO.herramientas)} herramientas · "
+                                "edita config/conectores_mcp.json para sumar servidores MCP")
+            bloques = []
+            for c in sorted(estado, key=lambda c: (not c["disponible"], c["origen"] != "integrado", c["nombre"])):
+                marca = "●" if c["disponible"] else "○"
+                bloques.append((f"{marca} {c['nombre']}\n", "titulo" if c["disponible"] else "apagado"))
+                detalle = c["descripcion"] if c["disponible"] else f"No disponible: {c['motivo']}"
+                bloques.append((f"{detalle}\n", "suave"))
+                if c["herramientas"]:
+                    bloques.append(("  " + "  ·  ".join(c["herramientas"]) + "\n", "herramienta"))
+                bloques.append(("\n", None))
+            for modulo, error in REGISTRO.errores_carga.items():
+                bloques.append((f"○ {modulo}: {error}\n", "apagado"))
+            escribir(bloques)
+
+        def recargar():
+            resumen.config(text="Reconectando servidores MCP…")
+            def trabajo():
+                mcp.conectar_todo()
+                ventana.after(0, mostrar)
+            threading.Thread(target=trabajo, daemon=True).start()
+
+        def abrir_configuracion():
+            import shutil
+            if not os.path.exists(mcp.RUTA_CONFIG):
+                ejemplo = os.path.join(os.path.dirname(mcp.RUTA_CONFIG), "conectores_mcp.example.json")
+                shutil.copyfile(ejemplo, mcp.RUTA_CONFIG)
+            os.startfile(mcp.RUTA_CONFIG)
+
+        busqueda.bind("<KeyRelease>", mostrar)
+        self._boton(barra, "Recargar MCP", recargar).pack(side="left", padx=(0, 8))
+        self._boton(barra, "Configurar MCP", abrir_configuracion).pack(side="left")
+        mostrar()
 
     def _enviar_desde_centro(self, ventana, texto):
         if ventana.winfo_exists():
