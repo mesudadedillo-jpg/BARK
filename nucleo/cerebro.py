@@ -15,8 +15,10 @@ from datetime import datetime
 from urllib.parse import quote_plus
 try:
     from llama_cpp import Llama
-except ImportError:  # Permite usar nube/UI aunque falte el respaldo local.
+    ERROR_LLAMA = None
+except Exception as _error:  # Falta, o Windows bloqueó llama.dll (Control de aplicaciones): Bark sigue con la nube.
     Llama = None
+    ERROR_LLAMA = str(_error)
 
 import sys
 import os
@@ -65,7 +67,7 @@ def cargar_modelo():
     with _bloqueo_modelo:
         if _modelo is None:
             if Llama is None:
-                raise RuntimeError("Falta llama-cpp-python; instala requirements.txt para habilitar el respaldo local.")
+                raise RuntimeError(f"El modelo local no está disponible: {ERROR_LLAMA or 'falta llama-cpp-python'}")
             rutas = [r for r in [config.RUTA_MODELO, *config.RUTAS_MODELO_RESPALDO] if os.path.isfile(r)]
             if not rutas:
                 raise RuntimeError(f"No se encontró el modelo local: {config.RUTA_MODELO}")
