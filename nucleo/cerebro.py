@@ -18,6 +18,19 @@ ERROR_LLAMA = None
 _llama_intentado = False
 
 
+def _control_inteligente_activo() -> bool:
+    """True si Smart App Control está en modo de aplicación (bloquea DLL sin firma)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\CI\Policy") as clave:
+            valor, _tipo = winreg.QueryValueEx(clave, "VerifiedAndReputablePolicyState")
+        return int(valor) == 1
+    except OSError:
+        return False
+
+
 def _importar_llama():
     """Carga llama-cpp solo cuando hace falta y una sola vez.
 
@@ -28,8 +41,15 @@ def _importar_llama():
     if _llama_intentado:
         return Llama
     _llama_intentado = True
-    if os.getenv("BARK_MODELO_LOCAL", "1").strip().lower() in {"0", "no", "false", "off"}:
+    preferencia = os.getenv("BARK_MODELO_LOCAL", "auto").strip().lower()
+    if preferencia in {"0", "no", "false", "off"}:
         ERROR_LLAMA = "desactivado con BARK_MODELO_LOCAL=0"
+        return None
+    if preferencia != "1" and _control_inteligente_activo():
+        # Con el Control inteligente de aplicaciones activo, Windows bloquea llama.dll
+        # y muestra «Imagen incorrecta» aunque se capture el error: mejor ni intentarlo.
+        ERROR_LLAMA = ("Windows (Control inteligente de aplicaciones) bloquea llama.dll; "
+                       "usa la nube o un motor firmado como Ollama")
         return None
     modo_anterior = None
     if sys.platform == "win32":
