@@ -7,6 +7,7 @@ o /olvidar para borrar tambien el historial local guardado.
 
 import sys
 
+import nucleo.sin_consola  # noqa: F401  (antes que todo: sin ventanas negras parpadeando)
 from acciones import comandos
 from nucleo.cerebro import configurar_solicitador_permiso, precalentar, procesar_mensaje
 from nucleo.escuchar import VozNoDisponible, ejecutar_modo_voz, solicitar_permiso_por_voz

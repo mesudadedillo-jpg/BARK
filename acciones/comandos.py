@@ -567,21 +567,49 @@ def liberar_ram_avanzada() -> str:
 # MANTENIMIENTO Y ARRANQUE DE WINDOWS
 # ============================================================
 
-_CLAVE_INICIO_DESACTIVADO = r"Software\\Bark\\InicioDesactivado"
+# Windows guarda si una entrada de inicio está activa en «StartupApproved», igual que
+# el Administrador de tareas: primer byte par = activa, impar = desactivada. Usarlo
+# es reversible y no borra nada.
+_APROBACION = {
+    r"Software\Microsoft\Windows\CurrentVersion\Run": r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+    r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run": r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32",
+    "carpeta": r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
+}
+_cache_inicio: tuple[float, list[dict]] | None = None
+
+
+def _estado_aprobacion(raiz, clave_aprobacion: str, nombre: str) -> bool:
+    import winreg
+    try:
+        with winreg.OpenKey(raiz, clave_aprobacion, 0, winreg.KEY_READ) as clave:
+            valor, _tipo = winreg.QueryValueEx(clave, nombre)
+        return not (bytes(valor)[:1] and bytes(valor)[0] & 1)
+    except OSError:
+        return True  # sin registro de aprobación = activa
+
+
+def _fijar_aprobacion(raiz, clave_aprobacion: str, nombre: str, activo: bool) -> None:
+    import struct
+    import time as _time
+    import winreg
+    if activo:
+        dato = b"\x02" + b"\x00" * 11
+    else:  # 03 + hora de desactivación en FILETIME, como lo escribe Windows
+        filetime = int((_time.time() + 11644473600) * 10_000_000)
+        dato = b"\x03\x00\x00\x00" + struct.pack("<Q", filetime)
+    with winreg.CreateKeyEx(raiz, clave_aprobacion, 0, winreg.KEY_SET_VALUE) as clave:
+        winreg.SetValueEx(clave, nombre, 0, winreg.REG_BINARY, dato)
 
 
 def _registro_inicio_windows() -> list[dict]:
     """Lee entradas Run sin ejecutar ni alterar nada."""
     if platform.system() != "Windows":
         return []
-    try:
-        import winreg
-    except ImportError:
-        return []
+    import winreg
     ubicaciones = (
-        (winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\Windows\\CurrentVersion\\Run", "Usuario actual"),
-        (winreg.HKEY_LOCAL_MACHINE, r"Software\\Microsoft\\Windows\\CurrentVersion\\Run", "Todos los usuarios"),
-        (winreg.HKEY_LOCAL_MACHINE, r"Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run", "Todos los usuarios (32 bits)"),
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", "Usuario actual"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Run", "Todos los usuarios"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run", "Todos los usuarios (32 bits)"),
     )
     entradas = []
     for raiz, ruta, origen in ubicaciones:
@@ -590,113 +618,148 @@ def _registro_inicio_windows() -> list[dict]:
                 for indice in range(winreg.QueryInfoKey(clave)[1]):
                     try:
                         nombre, comando, _ = winreg.EnumValue(clave, indice)
-                        entradas.append({"id": f"registro:{origen}:{nombre}", "nombre": nombre, "origen": origen, "tipo": "Registro", "detalle": str(comando), "ruta_registro": ruta, "raiz": raiz})
                     except OSError:
                         continue
+                    aprobacion = _APROBACION[ruta]
+                    entradas.append({"id": f"registro:{origen}:{nombre}", "nombre": nombre, "origen": origen, "tipo": "Registro",
+                                     "detalle": str(comando), "raiz": raiz, "aprobacion": aprobacion,
+                                     "activo": _estado_aprobacion(raiz, aprobacion, nombre)})
         except OSError:
             continue
     return entradas
 
 
 def _carpetas_inicio_windows() -> list[dict]:
+    import winreg
     carpetas = (
-        (os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup"), "Usuario actual"),
-        (os.path.join(os.environ.get("PROGRAMDATA", r"C:\\ProgramData"), "Microsoft", "Windows", "Start Menu", "Programs", "StartUp"), "Todos los usuarios"),
+        (os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup"), "Usuario actual", winreg.HKEY_CURRENT_USER),
+        (os.path.join(os.environ.get("PROGRAMDATA", r"C:\ProgramData"), "Microsoft", "Windows", "Start Menu", "Programs", "StartUp"), "Todos los usuarios", winreg.HKEY_LOCAL_MACHINE),
     )
     entradas = []
-    for carpeta, origen in carpetas:
+    for carpeta, origen, raiz in carpetas:
         if not os.path.isdir(carpeta):
             continue
         for nombre in os.listdir(carpeta):
             ruta = os.path.join(carpeta, nombre)
-            if os.path.isfile(ruta):
-                entradas.append({"id": f"carpeta:{ruta}", "nombre": os.path.splitext(nombre)[0], "origen": origen, "tipo": "Carpeta Inicio", "detalle": ruta, "ruta": ruta})
+            if os.path.isfile(ruta) and nombre.lower() != "desktop.ini":
+                entradas.append({"id": f"carpeta:{ruta}", "nombre": os.path.splitext(nombre)[0], "archivo": nombre, "origen": origen,
+                                 "tipo": "Carpeta Inicio", "detalle": ruta, "ruta": ruta, "raiz": raiz, "aprobacion": _APROBACION["carpeta"],
+                                 "activo": _estado_aprobacion(raiz, _APROBACION["carpeta"], nombre)})
     return entradas
 
 
 def _tareas_inicio_windows() -> list[dict]:
-    """Lista únicamente tareas de inicio/sesión, omitiendo las de Microsoft."""
+    """Tareas de terceros que arrancan al iniciar Windows o la sesión, con UNA sola consulta."""
     if platform.system() != "Windows":
         return []
+    script = (
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+        "Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\\Microsoft\\*' -and "
+        "($_.Triggers | Where-Object { $_.CimClass.CimClassName -in 'MSFT_TaskLogonTrigger','MSFT_TaskBootTrigger' }) } | "
+        "Select-Object TaskName,TaskPath,@{n='Estado';e={$_.State.ToString()}} | ConvertTo-Json -Compress"
+    )
     try:
-        salida = subprocess.run(["schtasks", "/Query", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=20, encoding="utf-8", errors="replace")
-        filas = list(csv.reader(salida.stdout.splitlines()))
-    except (OSError, subprocess.SubprocessError):
+        salida = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                                capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace").stdout.strip()
+        datos = json.loads(salida) if salida else []
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
         return []
-    entradas = []
-    for fila in filas:
-        if not fila or not fila[0] or "microsoft" in fila[0].lower():
-            continue
-        nombre_tarea = fila[0]
-        # Consultar XML da una señal fiable de que la tarea se activa al iniciar
-        # Windows o al iniciar sesión; no inferimos desde su nombre.
-        try:
-            xml = subprocess.run(["schtasks", "/Query", "/TN", nombre_tarea, "/XML"], capture_output=True, text=True, timeout=8, encoding="utf-8", errors="replace").stdout.lower()
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if "boottrigger" in xml or "logontrigger" in xml:
-            estado = fila[3] if len(fila) > 3 else ""
-            entradas.append({"id": f"tarea:{nombre_tarea}", "nombre": nombre_tarea.rsplit("\\", 1)[-1], "origen": "Programador de tareas", "tipo": "Tarea de inicio", "detalle": f"{nombre_tarea} · {estado}", "tarea": nombre_tarea})
+    if isinstance(datos, dict):
+        datos = [datos]
+    return [{"id": f"tarea:{t['TaskPath']}{t['TaskName']}", "nombre": t["TaskName"], "origen": "Programador de tareas",
+             "tipo": "Tarea de inicio", "detalle": f"{t['TaskPath']}{t['TaskName']}", "tarea": f"{t['TaskPath']}{t['TaskName']}",
+             "activo": t.get("Estado") != "Disabled"} for t in datos]
+
+
+def obtener_elementos_inicio(usar_cache: bool = True) -> list[dict]:
+    """Inventario local de elementos que se lanzan al encender o iniciar sesión (caché de 60 s)."""
+    global _cache_inicio
+    import time as _time
+    if usar_cache and _cache_inicio and _time.time() - _cache_inicio[0] < 60:
+        return _cache_inicio[1]
+    entradas = _registro_inicio_windows() + _carpetas_inicio_windows() + _tareas_inicio_windows()
+    _cache_inicio = (_time.time(), entradas)
     return entradas
-
-
-def obtener_elementos_inicio() -> list[dict]:
-    """Inventario local de elementos que se lanzan al encender o iniciar sesión."""
-    return _registro_inicio_windows() + _carpetas_inicio_windows() + _tareas_inicio_windows()
 
 
 def listar_elementos_inicio() -> str:
     """Muestra las aplicaciones y tareas de arranque detectadas, sin modificarlas."""
     if platform.system() != "Windows":
         return "La gestión de inicio está disponible actualmente para Windows."
-    entradas = obtener_elementos_inicio()
+    entradas = obtener_elementos_inicio(usar_cache=False)
     if not entradas:
-        return "No detecté elementos de inicio editables en Registro, carpetas Inicio ni tareas de terceros."
-    lineas = [f"Inicio de Windows: detecté {len(entradas)} elemento(s)."]
-    for entrada in entradas:
-        lineas.append(f"- {entrada['nombre']}  ·  {entrada['tipo']} / {entrada['origen']}\n  {entrada['detalle']}")
-    lineas.append("Para desactivar uno, di: «desactiva al inicio NOMBRE EXACTO». No se desinstala ninguna aplicación y Bark conserva una copia local de las entradas de tu usuario.")
+        return "No detecté elementos de inicio en Registro, carpetas Inicio ni tareas de terceros."
+    activas = [e for e in entradas if e["activo"]]
+    lineas = [f"Arrancan con Windows: {len(activas)} de {len(entradas)} elementos."]
+    for e in sorted(entradas, key=lambda e: (not e["activo"], e["nombre"].lower())):
+        lineas.append(f"{'●' if e['activo'] else '○ (desactivado)'} {e['nombre']}  ·  {e['tipo']}")
+    lineas.append("Di «desactiva al inicio Discord, Steam» (acepta varios y nombres aproximados) o «reactiva al inicio NOMBRE».")
     return "\n".join(lineas)
 
 
-def desactivar_elemento_inicio(nombre: str) -> str:
-    """Desactiva una única entrada coincidente; se llama tras confirmación explícita."""
-    consulta = nombre.strip().casefold()
-    if not consulta:
-        return "Indica el nombre exacto del elemento de inicio que quieres desactivar."
-    coincidencias = [e for e in obtener_elementos_inicio() if consulta == e["nombre"].casefold() or consulta in e["nombre"].casefold()]
-    if not coincidencias:
-        return f"No encontré un elemento de inicio que coincida con '{nombre}'. Primero pide «mostrar programas de inicio»."
-    if len(coincidencias) > 1:
-        return "Encontré varias coincidencias; indica uno de estos nombres exactos:\n" + "\n".join(f"- {e['nombre']} ({e['tipo']})" for e in coincidencias)
-    entrada = coincidencias[0]
+def _elegir_elementos_inicio(nombre: str, entradas: list[dict]) -> tuple[list[dict], list[str]]:
+    """Admite varios nombres separados por comas o «y», con coincidencia aproximada."""
+    elegidos, dudas = [], []
+    for parte in [p.strip() for p in re.split(r",|\sy\s", nombre) if p.strip()]:
+        exactos = [e for e in entradas if e["nombre"].casefold() == parte.casefold()]
+        if exactos:
+            elegidos.extend(exactos)
+            continue
+        puntajes = sorted(((apps.puntuar(parte, e["nombre"]), e) for e in entradas), key=lambda x: -x[0])
+        if puntajes and puntajes[0][0] >= 0.75 and (len(puntajes) == 1 or puntajes[0][0] - puntajes[1][0] >= 0.05):
+            elegidos.append(puntajes[0][1])
+        else:
+            parecidos = [e["nombre"] for p, e in puntajes[:3] if p >= 0.45]
+            dudas.append(f"'{parte}'" + (f" (¿{', '.join(parecidos)}?)" if parecidos else " (no encontrado)"))
+    return list({e["id"]: e for e in elegidos}.values()), dudas
+
+
+def _cambiar_elemento_inicio(entrada: dict, activo: bool) -> str:
+    accion = "Reactivé" if activo else "Desactivé"
+    if entrada["tipo"] == "Tarea de inicio":
+        resultado = subprocess.run(["schtasks", "/Change", "/TN", entrada["tarea"], "/Enable" if activo else "/Disable"],
+                                   capture_output=True, text=True, timeout=15, encoding="utf-8", errors="replace")
+        if resultado.returncode != 0:
+            return f"Windows no permitió cambiar '{entrada['nombre']}' (quizá necesite administrador)."
+        return f"{accion} '{entrada['nombre']}'."
+    nombre_valor = entrada.get("archivo", entrada["nombre"])
     try:
-        if entrada["tipo"] == "Registro":
-            import winreg
-            # Solo se permite modificar entradas del usuario; las globales pueden
-            # requerir administrador y no conviene intentar sortear esa protección.
-            if entrada["origen"] != "Usuario actual":
-                return f"'{entrada['nombre']}' es global. Abre el Administrador de tareas > Aplicaciones de inicio para administrarla con permisos de Windows."
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, entrada["ruta_registro"], 0, winreg.KEY_READ | winreg.KEY_SET_VALUE) as clave:
-                valor, tipo = winreg.QueryValueEx(clave, entrada["nombre"])
-                with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _CLAVE_INICIO_DESACTIVADO) as respaldo:
-                    winreg.SetValueEx(respaldo, entrada["nombre"], 0, tipo, valor)
-                winreg.DeleteValue(clave, entrada["nombre"])
-            return f"Desactivé '{entrada['nombre']}' del inicio y guardé una copia local para poder restaurarla."
-        if entrada["tipo"] == "Carpeta Inicio":
-            destino_base = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), "Bark", "InicioDesactivado")
-            os.makedirs(destino_base, exist_ok=True)
-            destino = os.path.join(destino_base, os.path.basename(entrada["ruta"]))
-            if os.path.exists(destino):
-                return f"Ya existe una copia de '{entrada['nombre']}' en el respaldo de Bark; no hice cambios."
-            shutil.move(entrada["ruta"], destino)
-            return f"Desactivé '{entrada['nombre']}' del inicio y moví su acceso directo a un respaldo local."
-        resultado = subprocess.run(["schtasks", "/Change", "/TN", entrada["tarea"], "/Disable"], capture_output=True, text=True, timeout=15, encoding="utf-8", errors="replace")
-        if resultado.returncode == 0:
-            return f"Desactivé la tarea de inicio '{entrada['nombre']}'. Puedes volver a habilitarla desde el Programador de tareas."
-        return f"Windows no permitió desactivar '{entrada['nombre']}': {resultado.stderr.strip() or resultado.stdout.strip()}"
-    except (OSError, subprocess.SubprocessError) as error:
-        return f"No se pudo desactivar '{entrada['nombre']}': {error}"
+        _fijar_aprobacion(entrada["raiz"], entrada["aprobacion"], nombre_valor, activo)
+    except PermissionError:
+        return f"'{entrada['nombre']}' es de todos los usuarios: abre Bark como administrador o usa el Administrador de tareas."
+    return f"{accion} '{entrada['nombre']}'."
+
+
+def desactivar_elemento_inicio(nombre: str) -> str:
+    """Desactiva uno o varios elementos de inicio como lo hace el Administrador de tareas (reversible)."""
+    return _cambiar_varios_inicio(nombre, activo=False)
+
+
+def reactivar_elemento_inicio(nombre: str) -> str:
+    """Vuelve a activar uno o varios elementos de inicio desactivados."""
+    return _cambiar_varios_inicio(nombre, activo=True)
+
+
+def _cambiar_varios_inicio(nombre: str, activo: bool) -> str:
+    global _cache_inicio
+    if platform.system() != "Windows":
+        return "La gestión de inicio está disponible actualmente para Windows."
+    if not nombre.strip():
+        return "Dime qué elemento de inicio cambiar."
+    elegidos, dudas = _elegir_elementos_inicio(nombre, obtener_elementos_inicio())
+    mensajes = []
+    for entrada in elegidos:
+        if entrada["activo"] == activo:
+            mensajes.append(f"'{entrada['nombre']}' ya estaba {'activo' if activo else 'desactivado'}.")
+        else:
+            try:
+                mensajes.append(_cambiar_elemento_inicio(entrada, activo))
+            except (OSError, subprocess.SubprocessError) as error:
+                mensajes.append(f"No pude cambiar '{entrada['nombre']}': {error}")
+    if dudas:
+        mensajes.append("No tuve claro cuál es: " + "; ".join(dudas) + ". Di «mostrar programas de inicio» para ver los nombres.")
+    _cache_inicio = None
+    return "\n".join(mensajes) or "No encontré esos elementos de inicio."
 
 
 def resumen_optimizacion() -> str:

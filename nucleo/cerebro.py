@@ -740,6 +740,9 @@ def _accion_directa(mensaje: str):
     inicio = re.fullmatch(r"(?:desactiva|quita|elimina)\s+(?:(?:al|del)\s+)?(?:inicio|arranque)\s+(.+)", texto)
     if inicio:
         return "desactivar_elemento_inicio", {"nombre": inicio.group(1).strip()}
+    reactiva = re.fullmatch(r"(?:reactiva|activa|vuelve a activar|habilita)\s+(?:(?:al|en el|del)\s+)?(?:inicio|arranque)\s+(.+)", texto)
+    if reactiva:
+        return "reactivar_elemento_inicio", {"nombre": reactiva.group(1).strip()}
 
     # Música: reconoce formas coloquiales mexicanas y abre Spotify con el
     # título/artista completo, sin hacer pasar la petición por el LLM.
