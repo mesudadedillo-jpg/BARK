@@ -13,12 +13,38 @@ import ast
 import operator
 from datetime import datetime
 from urllib.parse import quote_plus
-try:
-    from llama_cpp import Llama
-    ERROR_LLAMA = None
-except Exception as _error:  # Falta, o Windows bloqueó llama.dll (Control de aplicaciones): Bark sigue con la nube.
-    Llama = None
-    ERROR_LLAMA = str(_error)
+Llama = None
+ERROR_LLAMA = None
+_llama_intentado = False
+
+
+def _importar_llama():
+    """Carga llama-cpp solo cuando hace falta y una sola vez.
+
+    Si Windows (Control inteligente de aplicaciones) bloquea llama.dll, se suprime
+    su ventana de «Imagen incorrecta» y Bark sigue funcionando con la nube.
+    """
+    global Llama, ERROR_LLAMA, _llama_intentado
+    if _llama_intentado:
+        return Llama
+    _llama_intentado = True
+    if os.getenv("BARK_MODELO_LOCAL", "1").strip().lower() in {"0", "no", "false", "off"}:
+        ERROR_LLAMA = "desactivado con BARK_MODELO_LOCAL=0"
+        return None
+    modo_anterior = None
+    if sys.platform == "win32":
+        import ctypes
+        # SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX: sin cuadros de error del sistema.
+        modo_anterior = ctypes.windll.kernel32.SetErrorMode(0x8003)
+    try:
+        from llama_cpp import Llama as _Llama
+        Llama = _Llama
+    except Exception as error:
+        ERROR_LLAMA = str(error)
+    finally:
+        if modo_anterior is not None:
+            ctypes.windll.kernel32.SetErrorMode(modo_anterior)
+    return Llama
 
 import sys
 import os
@@ -66,7 +92,7 @@ def cargar_modelo():
     global _modelo
     with _bloqueo_modelo:
         if _modelo is None:
-            if Llama is None:
+            if _importar_llama() is None:
                 raise RuntimeError(f"El modelo local no está disponible: {ERROR_LLAMA or 'falta llama-cpp-python'}")
             rutas = [r for r in [config.RUTA_MODELO, *config.RUTAS_MODELO_RESPALDO] if os.path.isfile(r)]
             if not rutas:
