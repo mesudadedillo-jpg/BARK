@@ -11,7 +11,7 @@ bd_memoria/*
 resultados/*
 !resultados/.gitkeep
 tmp*/
-respaldo_antes_de_optimizar/
+respaldo_antes_de_*/
 
 # Modelos pesados: se descargan aparte (ver modelos/README.md)
 modelos/**/*.gguf
