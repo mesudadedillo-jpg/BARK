@@ -13,7 +13,7 @@ import threading
 import time
 import tkinter as tk
 from datetime import datetime
-from tkinter import colorchooser, messagebox, scrolledtext
+from tkinter import colorchooser, messagebox, scrolledtext, simpledialog
 
 from acciones import comandos
 from config import config
@@ -26,7 +26,7 @@ from nucleo.escuchar import (
     seleccionar_modelo_whisper, seleccionar_motor_voz, seleccionar_voz_local,
     solicitar_permiso_por_voz, voces_locales_disponibles,
 )
-from nucleo import audio_vivo, descargas, gemini_live, medios, permisos
+from nucleo import audio_vivo, descargas, escritorio, gemini_live, medios, permisos
 from nucleo.bd_manager import guardar_turno
 from nucleo.proveedores import estado_proveedores
 from nucleo.telemetria import Telemetria
@@ -92,8 +92,16 @@ def _formato_tiempo(segundos: float) -> str:
 
 class VentanaBark:
     def __init__(self):
+        escritorio.registrar_identidad()  # antes de la ventana: la barra de tareas muestra el orbe, no Python
         self.raiz = tk.Tk()
         self.raiz.title("Bark — Asistente personal")
+        self._logo_encabezado = None
+        try:
+            self.raiz.iconbitmap(default=escritorio.RUTA_ICONO)  # también para las ventanas secundarias
+            self._icono = tk.PhotoImage(file=escritorio.RUTA_LOGO)
+            self.raiz.iconphoto(True, self._icono)
+        except tk.TclError:
+            pass
         self.raiz.geometry("1360x820")
         self.raiz.minsize(1080, 680)
         self.raiz.configure(bg=HUD["fondo"])
@@ -152,6 +160,10 @@ class VentanaBark:
             pass
         self.microfono = tk.StringVar(value=next((nombre for nombre, indice in self.dispositivos_mic.items() if indice == config.DISPOSITIVO_ENTRADA_VOZ), AUTOMATICO_MIC))
         configurar_solicitador_permiso(self._pedir_permiso)
+        # La ciudad elegida en el panel de clima manda sobre .env (y la usan también la voz y Gemini Live).
+        ciudad_guardada = permisos.preferencia("ciudad")
+        if ciudad_guardada:
+            os.environ["BARK_CIUDAD"] = ciudad_guardada
         self._construir()
         self.raiz.after(20, self._integrar_con_windows)
         self.raiz.protocol("WM_DELETE_WINDOW", self._cerrar)
@@ -173,6 +185,13 @@ class VentanaBark:
         try:
             usuario = ctypes.windll.user32
             self._hwnd_principal = hwnd = _hwnd(self.raiz)
+            # Icono del orbe para la barra de tareas y Alt+Tab (la ventana sin marco no hereda el de Tk).
+            usuario.LoadImageW.restype = ctypes.c_void_p
+            usuario.SendMessageW.argtypes = (ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_void_p)
+            for tipo, lado in ((1, usuario.GetSystemMetrics(11)), (0, usuario.GetSystemMetrics(49))):  # SM_CXICON / SM_CXSMICON
+                icono = usuario.LoadImageW(None, escritorio.RUTA_ICONO, 1, lado, lado, 0x10)  # IMAGE_ICON, LR_LOADFROMFILE
+                if icono:
+                    usuario.SendMessageW(hwnd, 0x80, tipo, icono)  # WM_SETICON (1 = grande, 0 = chico)
             extendido = usuario.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
             usuario.SetWindowLongW(hwnd, -20, (extendido & ~0x00000080) | 0x00040000)  # sin TOOLWINDOW, con APPWINDOW
             estilo = usuario.GetWindowLongW(hwnd, -16)  # GWL_STYLE
@@ -339,12 +358,16 @@ class VentanaBark:
         color_estado, texto_estado = self._estado_visual()
         # Marca: hexágono y nombre.
         cx, cy = 34, 31
-        puntos = []
-        for i in range(6):
-            ang = math.radians(60 * i + 30)
-            puntos += [cx + math.cos(ang) * 15, cy + math.sin(ang) * 15]
-        c.create_polygon(puntos, outline=HUD["acento"], fill=HUD["panel"], width=2)
-        c.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, fill=color_estado, outline="")
+        logo = self._logo_pequeno()
+        if logo:
+            c.create_image(cx, cy, image=logo)
+        else:
+            puntos = []
+            for i in range(6):
+                ang = math.radians(60 * i + 30)
+                puntos += [cx + math.cos(ang) * 15, cy + math.sin(ang) * 15]
+            c.create_polygon(puntos, outline=HUD["acento"], fill=HUD["panel"], width=2)
+        c.create_oval(cx + 10, cy + 10, cx + 16, cy + 16, fill=color_estado, outline=HUD["fondo"], width=2)
         c.create_text(60, 24, text="BARK", anchor="w", fill=HUD["acento"], font=(FUENTE_HUD, 20, "bold"))
         c.create_text(61, 45, text="SISTEMA DE INTELIGENCIA PERSONAL  ·  LOCAL FIRST", anchor="w",
                       fill=HUD["tenue"], font=(FUENTE_HUD, 7))
@@ -379,6 +402,24 @@ class VentanaBark:
         c.create_line(0, 61, w, 61, fill=HUD["borde"])
         c.create_line(0, 61, 220, 61, fill=HUD["linea"], width=2)
         c.create_line(w - 220, 61, w, 61, fill=HUD["linea"], width=2)
+
+    def _logo_pequeno(self):
+        if self._logo_encabezado is None:
+            try:
+                from PIL import Image, ImageTk
+                with Image.open(escritorio.RUTA_LOGO) as imagen:
+                    self._logo_encabezado = ImageTk.PhotoImage(imagen.convert("RGBA").resize((44, 44), Image.LANCZOS))
+            except Exception:
+                self._logo_encabezado = False
+        return self._logo_encabezado or None
+
+    def _crear_accesos_directos(self):
+        try:
+            rutas = escritorio.crear_accesos()
+            self._agregar("Sistema", "Accesos directos creados en el Escritorio y en Inicio. Para anclarlo: clic derecho en Bark "
+                                     "(en Inicio) › Anclar a la barra de tareas.", "sistema")
+        except Exception as error:
+            self._agregar("Sistema", f"No pude crear los accesos directos: {error}", "sistema")
 
     def _estado_visual(self):
         color, etiqueta, _ = ESTADOS.get(self.estado, ESTADOS["en espera"])
@@ -436,8 +477,12 @@ class VentanaBark:
         self.clima_desc = tk.Label(columna, text="Consultando…", bg=HUD["panel"], fg=HUD["texto"], anchor="w",
                                    font=(FUENTE_TEXTO, 10, "bold"))
         self.clima_desc.pack(fill="x")
-        self.clima_ciudad = tk.Label(columna, text="", bg=HUD["panel"], fg=HUD["suave"], anchor="w", font=(FUENTE_TEXTO, 8))
+        self.clima_ciudad = tk.Label(columna, text="", bg=HUD["panel"], fg=HUD["suave"], anchor="w", font=(FUENTE_TEXTO, 8),
+                                     cursor="hand2")
         self.clima_ciudad.pack(fill="x")
+        self.clima_ciudad.bind("<Button-1>", lambda _e: self._cambiar_ciudad())
+        self.clima_ciudad.bind("<Enter>", lambda _e: (self.clima_ciudad.config(fg=HUD["acento"]), self._pista("Clic para cambiar la ciudad del clima")))
+        self.clima_ciudad.bind("<Leave>", lambda _e: (self.clima_ciudad.config(fg=HUD["suave"]), self._pista("")))
         self.clima_detalle = tk.Label(panel.cuerpo, text="", bg=HUD["panel"], fg=HUD["suave"], anchor="w",
                                       font=(FUENTE_HUD, 8), justify="left")
         self.clima_detalle.pack(fill="x", padx=10, pady=(2, 8))
@@ -721,6 +766,7 @@ class VentanaBark:
         self._boton(lateral, "Limpiar temporales", lambda: self._enviar_consulta("Limpiar temporales")).pack(fill="x", pady=4)
         self._etiqueta_seccion(lateral, "APARIENCIA Y SISTEMA")
         self._boton(lateral, "Personalizar colores", self._personalizar_colores).pack(fill="x", pady=4)
+        self._boton(lateral, "Crear acceso directo (Escritorio e Inicio)", self._crear_accesos_directos).pack(fill="x", pady=4)
         self._boton(lateral, "Limpiar conversación", self._limpiar_chat).pack(fill="x", pady=4)
         self._boton(lateral, "Reiniciar Bark", self._reiniciar_bark).pack(fill="x", pady=(12, 4))
         tk.Label(lateral, text=estado_proveedores(), justify="left", wraplength=280, font=(FUENTE_TEXTO, 8),
@@ -908,7 +954,9 @@ class VentanaBark:
         self.clima_icono.config(text=datos["icono"])
         self.clima_temp.config(text=f"{datos['temperatura']:.0f}°")
         self.clima_desc.config(text=datos["descripcion"].capitalize())
-        self.clima_ciudad.config(text=f"{datos['ciudad']}, {datos['region']}"[:40])
+        nombre = datos["ciudad"] if len(datos["ciudad"]) <= 22 else datos["ciudad"].split(" de ")[0]
+        region = datos["region"].removeprefix("Estado de ").removeprefix("Estado ")
+        self.clima_ciudad.config(text=f"📍 {nombre}, {region}"[:44])
         self.clima_detalle.config(text=f"SENSACIÓN {datos['sensacion']:.0f}°   ·   HUMEDAD {datos['humedad']}%   ·   VIENTO {datos['viento']:.0f} KM/H")
         for hijo in self.clima_pronostico.winfo_children():
             hijo.destroy()
@@ -919,6 +967,35 @@ class VentanaBark:
             tk.Label(fila, text=dia["icono"], bg=HUD["panel"], fg=HUD["acento"], font=(FUENTE_TEXTO, 11)).pack(side="left", padx=4)
             tk.Label(fila, text=f"{dia['maxima']:.0f}° / {dia['minima']:.0f}°", bg=HUD["panel"], fg=HUD["texto"], font=(FUENTE_HUD, 9)).pack(side="left", padx=6)
             tk.Label(fila, text=f"☂ {dia['lluvia']}%", bg=HUD["panel"], fg=HUD["suave"], font=(FUENTE_HUD, 8)).pack(side="right")
+
+    def _cambiar_ciudad(self):
+        """Fija la ciudad del clima (la ubicación por IP puede marcar otro municipio)."""
+        actual = os.getenv("BARK_CIUDAD", "") or (self._clima or {}).get("ciudad", "")
+        ciudad = simpledialog.askstring("Ciudad del clima", "¿En qué ciudad o municipio estás?", initialvalue=actual, parent=self.raiz)
+        if not ciudad or not ciudad.strip():
+            return
+        ciudad = ciudad.strip()
+        self.clima_desc.config(text="Buscando…")
+
+        def trabajo():
+            try:
+                from conectores.informacion import clima_datos
+                datos = clima_datos(ciudad)
+            except Exception:
+                datos = None
+
+            def aplicar():
+                if not datos:
+                    self.clima_desc.config(text=(self._clima or {}).get("descripcion", "Sin datos").capitalize())
+                    self._agregar("Sistema", f"No encontré «{ciudad}». Prueba con el nombre del municipio, p. ej. «Santiago Tulantepec».", "sistema")
+                    return
+                os.environ["BARK_CIUDAD"] = ciudad
+                permisos.guardar_preferencia("ciudad", ciudad)
+                self._mostrar_clima(datos)
+                self._agregar("Sistema", f"Ciudad del clima: {datos['ciudad']}, {datos['region']}.", "sistema")
+            self.raiz.after(0, aplicar)
+
+        threading.Thread(target=trabajo, name="bark-ciudad", daemon=True).start()
 
     def _expandir_clima(self, expandido):
         if expandido:
