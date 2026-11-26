@@ -141,7 +141,8 @@ cd BARK
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
-python descargar_modelo.py          # LLM local (~2.5 GB)
+python descargar_modelo.py          # detecta tu RAM y te propone el modelo adecuado (pide confirmación)
+python descargar_modelo.py --voces  # voces Piper optimizadas para tu equipo
 copy config\.env.example .env       # claves de API opcionales
 ```
 
@@ -155,6 +156,35 @@ python main.py          # consola
 
 La palabra de activación es **«Bark»**.
 
+> En el Explorador solo se ven `Iniciar_Bark.bat`, `.env`, `modelos/` (voces y modelos) y `resultados/` (documentos que Bark crea para ti). El código y los datos internos (`nucleo/`, `interfaz/`, `bd_memoria/`…) están ocultos: actívalos en **Vista › Mostrar › Elementos ocultos**. Los registros de inicio y de MCP van en `bd_memoria/registros/`.
+
+### 🧠 Modelo local según tu equipo
+
+| RAM total | Modelo | Tamaño |
+|---|---|---|
+| hasta 8 GB | Qwen3 1.7B: el más ligero que aún entiende órdenes | 1.1 GB |
+| 12-16 GB | Qwen3 4B Instruct 2507 | 2.5 GB |
+| 24 GB | Qwen3 8B | 5 GB |
+| 32-48 GB | Qwen3 30B-A3B (MoE: calidad grande, velocidad de 3B) | 18.6 GB |
+| 64 GB o más | DeepSeek R1 Distill Qwen 32B | 19.9 GB |
+
+Si el recomendado no está descargado, Bark usa el más capaz que tengas y que quepa en tu RAM. La interfaz muestra tu equipo y un botón para descargarlo.
+
+### 🎙️ Permisos y micrófono
+
+Bark pide permiso antes de usar el micrófono o la cámara por primera vez y comprueba que Windows no los bloquee (Configuración › Privacidad). En modo automático escucha en varios micrófonos a la vez, usa el que de verdad te oye y lo recuerda. **Probar micrófono** mide todos a la vez y te dice cuál capta tu voz.
+
+## 🛰️ Interfaz HUD y modo Live
+
+`Iniciar_Bark.bat` abre un visor futurista sin la barra de título de Windows (el encabezado del HUD hace de barra: arrástralo, doble clic para maximizar). Sigue apareciendo en la barra de tareas y en Alt+Tab.
+
+- **Orbe central**: se agranda y achica como una bocina con tu voz mientras escucha y con la voz de Bark mientras habla (Gemini, OpenAI o Piper).
+- **Paneles en vivo**: reloj, clima (Open-Meteo), CPU/RAM/batería con gráfica, y lo que suena en Windows (Spotify, YouTube en el navegador…) con portada, progreso y controles. El botón ▢ de cada panel lo agranda o achica; ⤢ / ⤡ agrandan o restauran la ventana del reproductor.
+- **Modo Live** (botón o F11): solo el orbe, subtítulos y conversación por voz continua. Toca el orbe o pulsa **Esc** para interrumpirlo; con «Interrumpir hablando» activado basta con hablarle encima.
+- **Gemini Live (voz a voz)**: con «Gemini Live» marcado, al activar la voz hablas directo con Gemini en tiempo real (detecta cuándo terminas, responde con su voz y se deja interrumpir). Cuando pides algo del equipo, Gemini se lo pasa al agente de Bark con sus herramientas y permisos. Lo que escribes en el chat entra a la misma conversación. Si Live no conecta (sin clave, sin cuota), Bark sigue con el modo clásico.
+- **Voces externas**: elige GEMINI, OPENAI (la voz de ChatGPT), LOCAL o AUTO en «Enlace de voz»; la elección se recuerda. La primera frase empieza a sonar mientras se sintetiza el resto.
+- **⚙ Ajustes**: micrófono, Whisper, modelos y voces de cada proveedor, visión, permisos y optimización.
+
 ## ⚙️ Configuración
 
 Todo se ajusta en `.env`, sin tocar código. Lo principal:
@@ -163,11 +193,16 @@ Todo se ajusta en `.env`, sin tocar código. Lo principal:
 |---|---|
 | `BARK_PROVEEDOR` | `auto`, `gemini`, `openai` o `local` (100 % offline) |
 | `BARK_VOZ` | `auto`, `gemini`, `openai` o `local` (Piper) |
-| `BARK_MODELO_LLM` | Fuerza un `.gguf` concreto de `modelos/` |
-| `BARK_GPU_LAYERS` | `-1` para usar GPU con llama-cpp-python |
+| `BARK_MODELO_LLM` | `auto` elige según tu RAM; o un `.gguf` de `modelos/`, o una clave (`qwen3-8b`, `deepseek-r1-32b`…) |
+| `BARK_GPU_LAYERS` | `auto` usa la GPU si llama-cpp tiene soporte y cabe en la VRAM; `0` solo CPU; `-1` todo a la GPU |
+| `BARK_MIC_DEVICE` | Índice fijo de micrófono; vacío = automático (escucha en varios y se queda con el que te oye) |
 | `BARK_MODELO_WHISPER` | `base` (rápido) o `small` (más preciso) |
 | `BARK_VOZ_DEBUG` | `1` guarda el último audio recibido para diagnosticar el micrófono |
 | `BARK_CIUDAD` | Ciudad para el clima cuando no dices cuál |
+| `BARK_GEMINI_LIVE` | `auto` usa Gemini Live si hay clave de Gemini; `0` siempre el modo clásico (Whisper + voz) |
+| `GEMINI_MODELO_LIVE` | Modelo de Live (por defecto `gemini-3.8-live`) |
+| `BARK_INTERRUMPIR_VOZ` | `1` = hablar encima de Bark lo interrumpe (como Gemini Live). Mejor con audífonos |
+| `BARK_VOZ_UMBRAL_INTERRUPCION` | Qué tan fuerte hay que hablar para interrumpir (RMS, por defecto 900) |
 
 La guía completa de órdenes y ajustes está en [`docs/GUIA.md`](docs/GUIA.md).
 

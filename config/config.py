@@ -7,6 +7,8 @@ import os
 import shutil
 from pathlib import Path
 
+from config import hardware
+
 
 def _cargar_env_local() -> None:
     """Carga un .env simple sin introducir otra dependencia ni sobrescribir Windows."""
@@ -70,6 +72,10 @@ VOZ_UMBRAL_RMS = int(os.getenv("BARK_VOZ_UMBRAL_RMS", "20"))
 # Conversacional no significa responder a todo lo que oye: un filtro local
 # acepta preguntas, órdenes y seguimientos, pero ignora charla ambiental.
 ESCUCHA_LIBRE = os.getenv("BARK_ESCUCHA_LIBRE", "1").strip().lower() in {"1", "true", "si", "sí", "on"}
+# Estilo Live: hablar por encima de Bark lo interrumpe. Sin cancelación de eco el
+# micrófono también oye los altavoces, así que es opcional (ideal con audífonos).
+INTERRUMPIR_CON_VOZ = os.getenv("BARK_INTERRUMPIR_VOZ", "0").strip().lower() in {"1", "true", "si", "sí", "on"}
+VOZ_UMBRAL_INTERRUPCION = float(os.getenv("BARK_VOZ_UMBRAL_INTERRUPCION", "900"))
 VENTANA_CONTEXTO_VOZ_SEGUNDOS = float(os.getenv("BARK_VENTANA_CONTEXTO_VOZ", "45"))
 # Piper: length_scale <1 = más rápido. Más variación de tono/ritmo = menos plano y robótico
 # (valores de fábrica de Piper: 0.667 y 0.8). Si notas artefactos, bájalos hacia esos valores.
@@ -90,31 +96,50 @@ def _modelos_gguf() -> list[str]:
 
 
 def _elegir_modelo_llm() -> str:
-    """BARK_MODELO_LLM manda; si no, el más capaz que esté descargado."""
+    """BARK_MODELO_LLM manda; si no, el adecuado para la RAM de este equipo (ver config/hardware.py)."""
     pedido = os.getenv("BARK_MODELO_LLM", "").strip().strip('"')
-    if pedido:
+    disponibles = _modelos_gguf()
+    if pedido and pedido.lower() != "auto":
         ruta = pedido if os.path.isabs(pedido) else os.path.join(CARPETA_MODELOS, pedido)
         if os.path.isfile(ruta):
             return ruta
-    disponibles = _modelos_gguf()
-    for preferido in ("qwen3-4b-instruct-2507", "qwen3-4b", "qwen2.5-3b-instruct"):
-        for ruta in disponibles:
-            if preferido in os.path.basename(ruta).lower():
-                return ruta
-    return disponibles[0] if disponibles else os.path.join(CARPETA_MODELOS, "qwen2.5-3b-instruct-q4_k_m.gguf")
+        # También acepta la clave corta del catálogo: BARK_MODELO_LLM=qwen3-8b
+        modelo = hardware.buscar_en_catalogo(pedido)
+        if modelo:
+            for ruta in disponibles:
+                if modelo.coincide(os.path.basename(ruta)):
+                    return ruta
+    elegido = hardware.elegir_modelo(disponibles)
+    return elegido or os.path.join(CARPETA_MODELOS, MODELO_RECOMENDADO.archivo)
 
 
+EQUIPO = hardware.detectar_equipo()
+MODELO_RECOMENDADO = hardware.modelo_recomendado(EQUIPO)
 RUTA_MODELO = _elegir_modelo_llm()
 NOMBRE_MODELO = os.path.basename(RUTA_MODELO)
-# Si el modelo elegido no carga (llama-cpp antiguo), se prueban estos en orden.
-RUTAS_MODELO_RESPALDO = [r for r in _modelos_gguf() if r != RUTA_MODELO]
+# True si el modelo recomendado para este equipo aún no está descargado.
+FALTA_MODELO_RECOMENDADO = not any(MODELO_RECOMENDADO.coincide(os.path.basename(r)) for r in _modelos_gguf())
+# Si el modelo elegido no carga (llama-cpp antiguo, RAM insuficiente), se prueban
+# los demás: primero los que caben en este equipo, del más capaz al más ligero.
+RUTAS_MODELO_RESPALDO = sorted(
+    (r for r in _modelos_gguf() if r != RUTA_MODELO),
+    key=lambda r: (not hardware.cabe_en_equipo(r, EQUIPO), -os.path.getsize(r)),
+)
 
-# Un contexto moderado reduce RAM y el tiempo de prellenado. Puede elevarse
-# desde .env cuando una tarea de código realmente necesite más historial.
-CONTEXTO_MAX = max(2048, int(os.getenv("BARK_CONTEXTO_MAX", "3072")))
-HILOS_CPU = max(1, int(os.getenv("BARK_HILOS_CPU", str(min(8, os.cpu_count() or 4)))))
-# 0 = solo CPU. Con GPU compatible (CUDA/Vulkan) pon BARK_GPU_LAYERS=-1 en .env para descargarlo todo a la GPU.
-GPU_LAYERS = int(os.getenv("BARK_GPU_LAYERS", "0"))
+
+def _entero_env(nombre: str, automatico: int) -> int:
+    valor = os.getenv(nombre, "").strip().lower()
+    return automatico if valor in {"", "auto"} else int(valor)
+
+
+# Contexto, hilos y GPU se ajustan solos al equipo; cualquier valor en .env manda.
+CONTEXTO_MAX = max(2048, _entero_env("BARK_CONTEXTO_MAX", hardware.contexto_recomendado(RUTA_MODELO, EQUIPO)))
+HILOS_CPU = max(1, _entero_env("BARK_HILOS_CPU", hardware.hilos_recomendados(EQUIPO)))
+# auto: si llama-cpp tiene soporte de GPU (CUDA/Vulkan), descarga a la VRAM lo que quepa.
+# 0 = solo CPU; -1 = todo a la GPU.
+_GPU_PEDIDA = os.getenv("BARK_GPU_LAYERS", "auto").strip().lower()
+GPU_LAYERS = hardware.capas_gpu_automaticas(RUTA_MODELO, EQUIPO) if _GPU_PEDIDA in {"", "auto"} else int(_GPU_PEDIDA)
+GPU_LAYERS_AUTOMATICO = _GPU_PEDIDA in {"", "auto"}
 # auto: precarga el modelo local al iniciar solo si no hay claves de nube. 1/0 fuerzan.
 PRECALENTAR_MODELO = os.getenv("BARK_PRECALENTAR", "auto").strip().lower()
 LOTE_LOCAL = max(64, int(os.getenv("BARK_LOTE_LOCAL", "512")))
@@ -153,4 +178,10 @@ TIEMPO_ESPERA_VOZ_NUBE = float(os.getenv("BARK_TIMEOUT_VOZ", "4"))
 VOCES_OPENAI = ("alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse", "marin", "cedar")
 MODELOS_TTS_OPENAI = ("gpt-4o-mini-tts", "gpt-4o-mini-tts-2025-12-15", "tts-1", "tts-1-hd")
 MODELOS_TTS_GEMINI = ("gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts")
+# Gemini Live: voz a voz en tiempo real (micrófono en streaming, respuesta con voz e interrupciones).
+# auto = se usa si hay GEMINI_API_KEY; 0 = siempre el modo clásico (Whisper + voz de Bark).
+GEMINI_MODELO_LIVE = os.getenv("GEMINI_MODELO_LIVE", "gemini-3.8-live")
+USAR_GEMINI_LIVE = os.getenv("BARK_GEMINI_LIVE", "auto").strip().lower()
+MODELOS_LIVE_GEMINI = ("gemini-3.8-live", "gemini-3.8-live-extended-thinking", "gemini-3.1-flash-live-preview",
+                       "gemini-2.5-flash-native-audio-preview-12-2025")
 VOCES_GEMINI = ("Kore", "Puck", "Aoede", "Achird", "Achernar", "Algieba", "Autonoe", "Callirrhoe", "Charon", "Despina", "Erinome", "Fenrir", "Gacrux", "Leda", "Orus", "Sulafat", "Zephyr")

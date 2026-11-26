@@ -16,8 +16,8 @@ modelos/
 
 | Modelo | Cómo obtenerlo |
 |---|---|
-| **LLM (Qwen3-4B, GGUF Q4_K_M)** | `python descargar_modelo.py` |
-| **Voz Piper** | [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices/tree/main/es/es_MX/claude/high) — descarga el `.onnx` y su `.onnx.json` |
+| **LLM (según tu RAM: Qwen3 1.7B … DeepSeek R1 32B)** | `python descargar_modelo.py` (`--lista` para ver todos) |
+| **Voz Piper** | `python descargar_modelo.py --voces`, o a mano desde [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices/tree/main/es/es_MX/claude/high) — descarga el `.onnx` y su `.onnx.json` |
 | **Whisper** | Automático: `faster-whisper` lo descarga en `modelos/whisper/` al primer uso |
 | **MediaPipe** | [gesture_recognizer.task](https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/latest/gesture_recognizer.task) · [face_landmarker.task](https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task) |
 

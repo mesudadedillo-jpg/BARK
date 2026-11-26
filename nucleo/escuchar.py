@@ -4,9 +4,7 @@ import os
 import base64
 import collections
 import queue
-import tempfile
 import wave
-import winsound
 import time
 import re
 import threading
@@ -15,6 +13,7 @@ import requests
 from difflib import get_close_matches
 
 from config import config
+from nucleo import audio_vivo
 from nucleo.proveedores import _sesion_red
 
 
@@ -137,13 +136,19 @@ def dispositivos_entrada() -> list[dict]:
 
 
 def seleccionar_dispositivo_entrada(indice: int | None) -> None:
-    """Elige el micrófono que se utilizará durante esta ejecución."""
-    global _modelo_whisper
+    """Elige el micrófono (None = automático) y lo recuerda para las próximas sesiones."""
     if indice is not None:
         dispositivos = {dispositivo["indice"] for dispositivo in dispositivos_entrada()}
         if indice not in dispositivos:
             raise ValueError("El micrófono seleccionado ya no está disponible.")
+    global _microfono_confirmado
     config.DISPOSITIVO_ENTRADA_VOZ = indice
+    if indice is not None:
+        _recordar_microfono(indice)
+    else:  # «Automático»: se vuelve a buscar cuál micrófono te oye
+        _microfono_confirmado = None
+        from nucleo import permisos
+        permisos.guardar_preferencia("microfono_nombre", None)
 
 
 def modelos_whisper_disponibles() -> list[str]:
@@ -194,63 +199,123 @@ def seleccionar_motor_voz(motor: str) -> None:
     config.MODO_VOZ = motor
 
 
-def _abrir_flujo_entrada(callback):
-    """Abre el primer micrófono operativo y lo conserva para la sesión actual."""
-    global _ultimo_microfono_automatico
+_VIRTUALES = ("asignador de sonido", "controlador primario", "sound mapper", "primary sound capture",
+              "mezcla estéreo", "mezcla estereo", "stereo mix", "what u hear", "altavoz", "speaker", "output")
+_ORDEN_API = {"MME": 3, "Windows DirectSound": 2, "Windows WASAPI": 1}
+# Índice que ya entregó voz en esta sesión (selección automática).
+_microfono_confirmado = None
+_escuchas_sin_voz = 0
+
+
+def _clave_fisica(nombre: str) -> str:
+    """MME recorta los nombres a 31 caracteres: así se agrupa el mismo micrófono en todas las API."""
+    return " ".join(nombre.lower().split())[:31]
+
+
+def candidatos_microfono() -> list[dict]:
+    """Micrófonos físicos, uno por aparato, del más probable al menos probable.
+
+    Orden: el que ya funcionó antes (guardado) › el predeterminado de Windows › otros
+    micrófonos reales › entradas WDM-KS (suelen ser jacks de 3.5 mm vacíos que entregan
+    un siseo y nunca voz). Se omiten mezcladores virtuales y perfiles Bluetooth
+    «manos libres» de aparatos desconectados.
+    """
     import sounddevice as sd
-    seleccion_automatica = config.DISPOSITIVO_ENTRADA_VOZ is None
-    if not seleccion_automatica:
-        candidatos = [config.DISPOSITIVO_ENTRADA_VOZ]
-    else:
-        # ``None`` suele resolver al "Asignador de sonido Microsoft", un
-        # intermediario virtual que puede abrirse sin recibir voz. Priorizamos
-        # entradas físicas reales, dejando los mapeadores del sistema al final.
-        entradas = dispositivos_entrada()
+    from nucleo import permisos
+    try:
+        apis = [api["name"] for api in sd.query_hostapis()]
+        dispositivos = list(sd.query_devices())
+    except Exception:
+        return []
+    try:
+        predeterminado = int(sd.default.device[0])
+    except (TypeError, ValueError, IndexError):
+        predeterminado = -1
+    clave_predeterminada = _clave_fisica(dispositivos[predeterminado]["name"]) if 0 <= predeterminado < len(dispositivos) else ""
+    guardado = _clave_fisica(permisos.preferencia("microfono_nombre") or "")
+    mejores: dict[str, tuple] = {}
+    for indice, d in enumerate(dispositivos):
+        if d["max_input_channels"] < 1:
+            continue
+        nombre = d["name"]
+        bajo = nombre.lower()
+        if any(v in bajo for v in _VIRTUALES) or "hands-free" in bajo or "bthhfenum" in bajo or bajo.strip() in {"input ()", "input"}:
+            continue
+        api = apis[d["hostapi"]] if d["hostapi"] < len(apis) else ""
+        clave = _clave_fisica(nombre)
+        puntaje = (
+            1 if guardado and clave == guardado else 0,
+            1 if clave == clave_predeterminada else 0,
+            0 if "WDM-KS" in api else 1,
+            _ORDEN_API.get(api, 0),
+            1 if ("micr" in bajo or "mic " in bajo or "array" in bajo) else 0,
+        )
+        info = {"indice": indice, "nombre": nombre, "api": api, "frecuencia": int(d["default_samplerate"]),
+                "wdmks": "WDM-KS" in api, "puntaje": puntaje}
+        if clave not in mejores or puntaje > mejores[clave]["puntaje"]:
+            mejores[clave] = info
+    return sorted(mejores.values(), key=lambda i: i["puntaje"], reverse=True)
 
-        def prioridad(dispositivo):
-            nombre = dispositivo["nombre"].lower()
-            virtual = any(texto in nombre for texto in (
-                "asignador de sonido", "controlador primario", "sound mapper",
-                "primary sound capture", "mezcla estéreo", "stereo mix",
-            ))
-            microfono = "micrófono" in nombre or "microphone" in nombre
-            # En este equipo Realtek/AMD son las entradas integradas. Los
-            # perfiles Bluetooth "Hands-Free" aparecen aun desconectados y
-            # suelen abrirse sin señal, por eso van después de ellas.
-            integrado = 2 if "realtek" in nombre else 1 if ("amd" in nombre or "array" in nombre) else 0
-            bluetooth = "hands-free" in nombre or "bthhfenum" in nombre
-            return (0 if virtual else 1, integrado, 0 if bluetooth else 1, 1 if microfono else 0)
 
-        candidatos = [d["indice"] for d in sorted(entradas, key=prioridad, reverse=True)]
-        # Tras un periodo sin señal se rota la prioridad. Esto evita que un
-        # micrófono virtual o desconectado capture siempre el modo de voz.
-        if _ultimo_microfono_automatico in candidatos:
-            posicion = candidatos.index(_ultimo_microfono_automatico)
-            candidatos = candidatos[posicion + 1:] + candidatos[:posicion + 1]
-    errores = []
-    for candidato in dict.fromkeys(candidatos):
+def _abrir_flujo(candidato, callback):
+    """Abre un micrófono a 16 kHz (lo que usa Whisper) o, si no puede, a su tasa nativa."""
+    import sounddevice as sd
+    dispositivo = sd.query_devices(candidato, kind="input")
+    ultimo = None
+    for tasa in dict.fromkeys((FRECUENCIA_WHISPER, int(dispositivo["default_samplerate"]))):
         try:
-            dispositivo = sd.query_devices(candidato, kind="input")
+            return sd.RawInputStream(samplerate=tasa, blocksize=int(tasa * 0.064), dtype="int16",
+                                     channels=1, device=candidato, callback=callback)
+        except Exception as error:
+            ultimo = error
+    raise ultimo or RuntimeError("no se pudo abrir")
+
+
+def _microfonos_a_escuchar() -> list[int]:
+    """Uno solo si el usuario eligió o ya se confirmó uno; si no, hasta 3 a la vez."""
+    if config.DISPOSITIVO_ENTRADA_VOZ is not None:
+        return [config.DISPOSITIVO_ENTRADA_VOZ]
+    candidatos = candidatos_microfono()
+    indices = {c["indice"] for c in candidatos}
+    if _microfono_confirmado in indices:
+        return [_microfono_confirmado]
+    from nucleo import permisos
+    guardado = permisos.preferencia("microfono_nombre")
+    if guardado and candidatos and _clave_fisica(candidatos[0]["nombre"]) == _clave_fisica(guardado):
+        return [candidatos[0]["indice"]]
+    # Las entradas WDM-KS pueden acaparar el hardware que usan las demás: solo si no hay otras.
+    normales = [c["indice"] for c in candidatos if not c["wdmks"]]
+    return (normales or [c["indice"] for c in candidatos])[:3]
+
+
+def _abrir_flujo_entrada(callback):
+    """Compatibilidad: abre el primer micrófono operativo."""
+    errores = []
+    for candidato in _microfonos_a_escuchar() + [None]:
+        try:
+            return _abrir_flujo(candidato, callback)
         except Exception as error:
             errores.append(str(error))
-            continue
-        # Se pide 16 kHz directamente (lo que Whisper necesita); si el dispositivo
-        # no lo admite se abre a su tasa nativa y luego se remuestrea.
-        for tasa in dict.fromkeys((FRECUENCIA_WHISPER, int(dispositivo["default_samplerate"]))):
-            try:
-                flujo = sd.RawInputStream(
-                    samplerate=tasa, blocksize=int(tasa * 0.064),
-                    dtype="int16", channels=1, device=candidato, callback=callback,
-                )
-            except Exception as error:
-                errores.append(str(error))
-                continue
-            if candidato is not None and not seleccion_automatica:
-                config.DISPOSITIVO_ENTRADA_VOZ = candidato
-            if seleccion_automatica:
-                _ultimo_microfono_automatico = candidato
-            return flujo
     raise VozNoDisponible("No se pudo abrir ningún micrófono: " + (errores[0] if errores else "sin entradas disponibles."))
+
+
+def _nombre_dispositivo(indice) -> str:
+    try:
+        import sounddevice as sd
+        return sd.query_devices(indice, kind="input")["name"]
+    except Exception:
+        return str(indice)
+
+
+def _recordar_microfono(indice) -> None:
+    """El micrófono que entregó voz real se usa directamente en la siguiente sesión."""
+    global _microfono_confirmado
+    _microfono_confirmado = indice
+    try:
+        from nucleo import permisos
+        permisos.guardar_preferencia("microfono_nombre", _nombre_dispositivo(indice))
+    except Exception:
+        pass
 
 
 def voces_locales_disponibles() -> list[str]:
@@ -281,30 +346,79 @@ def verificar_voz() -> None:
         raise VozNoDisponible("Falta faster-whisper. Instálalo y reinicia Bark.") from error
 
 
-def diagnosticar_microfono(duracion: float = 1.5) -> str:
-    """Comprueba que el micrófono abre y entrega señal de audio real."""
-    try:
-        import sounddevice as sd
-        import numpy as np
+def probar_microfonos(duracion: float = 3.0) -> list[dict]:
+    """Graba a la vez de todos los micrófonos candidatos y mide voz, ruido y pico de cada uno."""
+    import sounddevice as sd  # noqa: F401  (falla aquí si no está instalado)
+    niveles: dict = {}
+    picos: dict = {}
+    flujos = []
+    for c in candidatos_microfono()[:6]:
+        indice = c["indice"]
+        niveles[indice], picos[indice] = [], [0.0]
 
-        candidatos = [config.DISPOSITIVO_ENTRADA_VOZ] if config.DISPOSITIVO_ENTRADA_VOZ is not None else [None] + [d["indice"] for d in dispositivos_entrada()]
-        errores = []
-        for candidato in dict.fromkeys(candidatos):
+        def callback(indata, frames, time_info, status, indice=indice):
+            muestras = np.frombuffer(bytes(indata), dtype=np.int16).astype(np.float32)
+            if len(muestras):
+                niveles[indice].append(float(np.sqrt(np.mean(muestras ** 2))))
+                picos[indice].append(float(np.abs(muestras).max()))
+
+        try:
+            flujo = _abrir_flujo(indice, callback)
+            flujo.start()
+            flujos.append((c, flujo))
+        except Exception as error:
+            c["error"] = str(error)
+            flujos.append((c, None))
+    time.sleep(duracion)
+    resultados = []
+    for c, flujo in flujos:
+        if flujo is not None:
             try:
-                dispositivo = sd.query_devices(candidato, kind="input")
-                frecuencia = int(dispositivo["default_samplerate"])
-                audio = sd.rec(int(frecuencia * duracion), samplerate=frecuencia, channels=1, dtype="int16", device=candidato)
-                sd.wait()
-                nivel_rms = int(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
-                if candidato is not None and config.DISPOSITIVO_ENTRADA_VOZ is None:
-                    config.DISPOSITIVO_ENTRADA_VOZ = candidato
-                estado = "Se detectó sonido." if nivel_rms >= config.VOZ_UMBRAL_RMS else "El dispositivo funciona, pero no detectó voz suficiente."
-                return f"Micrófono abierto: {dispositivo['name']} (índice {dispositivo['index']}, {frecuencia} Hz). Nivel: {nivel_rms}; umbral: {config.VOZ_UMBRAL_RMS}. {estado}"
-            except Exception as error:
-                errores.append(str(error))
-        return "No pude abrir ningún micrófono. " + (errores[0] if errores else "Windows no entregó dispositivos de entrada.")
+                flujo.stop()
+                flujo.close()
+            except Exception:
+                pass
+        lista = sorted(niveles.get(c["indice"], []))
+        ruido = lista[len(lista) // 5] if lista else 0.0     # percentil 20: el fondo
+        voz = lista[int(len(lista) * 0.9)] if lista else 0.0  # percentil 90: lo más fuerte
+        resultados.append({**c, "ruido": ruido, "voz": voz, "pico": max(picos.get(c["indice"], [0.0])),
+                           "relacion": voz / max(ruido, 1.0)})
+    return resultados
+
+
+def diagnosticar_microfono(duracion: float = 3.0) -> str:
+    """Prueba todos los micrófonos a la vez y elige el que mejor te oye. Habla durante la prueba."""
+    from nucleo import permisos
+    if permisos.estado_windows("microphone") == "denegado":
+        return permisos.explicar_bloqueo("microphone")
+    try:
+        resultados = probar_microfonos(duracion)
     except Exception as error:
-        return f"No pude grabar desde el micrófono predeterminado: {error}"
+        return f"No pude grabar desde los micrófonos: {error}"
+    if not resultados:
+        return ("Windows no entregó ningún micrófono. Conecta uno o revisa que no esté desactivado "
+                "en Configuración › Sistema › Sonido.")
+    lineas = []
+    for r in resultados:
+        if r.get("error"):
+            lineas.append(f"✗ {r['nombre']}: no abre ({r['error'][:60]})")
+        else:
+            lineas.append(f"• {r['nombre']} [{r['api']}]: voz {r['voz']:.0f} · fondo {r['ruido']:.0f} · pico {r['pico']:.0f}")
+    abiertos = [r for r in resultados if not r.get("error")]
+    con_voz = [r for r in abiertos if r["voz"] >= config.VOZ_UMBRAL_RMS * 0.4 and r["relacion"] >= 3]
+    if con_voz:
+        mejor = max(con_voz, key=lambda r: (r["relacion"], r["voz"]))
+        if config.DISPOSITIVO_ENTRADA_VOZ is None:
+            _recordar_microfono(mejor["indice"])
+        conclusion = f"✓ Te oigo mejor por «{mejor['nombre']}». Lo usaré en el modo voz."
+    elif abiertos and all(r["pico"] == 0 for r in abiertos):
+        conclusion = ("Todos los micrófonos entregan silencio absoluto: suele ser el micrófono silenciado, una tecla "
+                      "de silencio del teclado o el permiso de privacidad de Windows. Revisa Configuración › Privacidad "
+                      "› Micrófono y el panel Sonido › Grabación.")
+    else:
+        conclusion = ("Ningún micrófono captó voz clara. Habla durante los 3 segundos de la prueba; si sigue igual, "
+                      "sube el volumen de entrada en Sonido › Grabación › Propiedades › Niveles.")
+    return f"Prueba de micrófonos ({duracion:.0f} s):\n" + "\n".join(lineas) + "\n" + conclusion
 
 
 _bloqueo_whisper = threading.Lock()
@@ -373,80 +487,142 @@ def _transcribir(audio: np.ndarray) -> str:
     return "" if es_alucinacion(texto) else texto
 
 
+class _Entrada:
+    """Estado de escucha de un micrófono: su detector y lo que lleva grabado."""
+
+    def __init__(self, indice, frecuencia: int):
+        self.indice, self.frecuencia = indice, frecuencia
+        self.detector = DetectorVoz(
+            umbral_minimo=max(6.0, config.VOZ_UMBRAL_RMS * 0.4),
+            silencio_final=config.VOZ_SILENCIO_FINAL_SEGUNDOS,
+            max_frase=config.VOZ_TIEMPO_MAX_FRASE_SEGUNDOS,
+        )
+        self.bloques: list = []
+        self.prebuffer = collections.deque(maxlen=10)
+        self.hablaba = False
+        self.terminado = False
+        self.pico_absoluto = 0.0
+
+    def procesar(self, bloque: bytes) -> str:
+        muestras = np.frombuffer(bloque, dtype=np.int16)
+        if not len(muestras):
+            return "esperando"
+        self.pico_absoluto = max(self.pico_absoluto, float(np.abs(muestras.astype(np.int32)).max()))
+        rms = float(np.sqrt(np.mean(muestras.astype(np.float32) ** 2)))
+        audio_vivo.reportar("entrada", rms)  # el orbe de la interfaz late con tu voz
+        estado = self.detector.procesar(rms, len(muestras) / self.frecuencia)
+        if self.detector.hablando:
+            if not self.hablaba:
+                self.bloques = list(self.prebuffer)  # conserva la primera sílaba de «Bark»
+            self.bloques.append(bloque)
+        else:
+            if self.hablaba:
+                self.bloques = []  # ruido breve descartado
+            self.prebuffer.append(bloque)
+        self.hablaba = self.detector.hablando
+        return estado
+
+
 def _escuchar_frase_whisper(detener_evento=None, al_parcial=None, al_evento=None) -> str:
-    """Captura una frase con detección adaptativa de voz y la transcribe localmente."""
-    import sounddevice as sd
-    global _ultimo_microfono_automatico
+    """Captura una frase con detección adaptativa de voz y la transcribe localmente.
+
+    Mientras no se sepa qué micrófono te oye, escucha en varios a la vez y usa el
+    primero que capte una frase completa; ese queda recordado.
+    """
+    import contextlib
+    from nucleo import permisos
+    global _microfono_confirmado, _escuchas_sin_voz
+
+    if permisos.estado_windows("microphone") == "denegado":
+        raise VozNoDisponible(permisos.explicar_bloqueo("microphone"))
 
     cola = queue.Queue()
     avisos = []
-
-    def callback(indata, frames, time_info, status):
-        if status:
-            avisos.append(str(status))
-        cola.put(bytes(indata))
-
-    flujo = _abrir_flujo_entrada(callback)
-    frecuencia = int(flujo.samplerate)
-    if al_evento:
+    entradas: dict = {}
+    flujos = []
+    errores = []
+    for candidato in _microfonos_a_escuchar():
+        def callback(indata, frames, time_info, status, candidato=candidato):
+            if status:
+                avisos.append(str(status))
+            cola.put((candidato, bytes(indata)))
         try:
-            mensaje = f"Micrófono activo: {sd.query_devices(flujo.device, kind='input')['name']} · habla ahora."
-        except Exception:
-            mensaje = "Micrófono activo · habla ahora."
+            flujo = _abrir_flujo(candidato, callback)
+        except Exception as error:
+            errores.append(str(error))
+            continue
+        entradas[candidato] = _Entrada(candidato, int(flujo.samplerate))
+        flujos.append(flujo)
+    if not flujos:
+        if config.DISPOSITIVO_ENTRADA_VOZ is not None:
+            raise VozNoDisponible("No pude abrir el micrófono elegido: " + (errores[0] if errores else "no disponible")
+                                  + ". Elige «Automático» o prueba otro.")
+        try:
+            flujo = _abrir_flujo(None, lambda indata, *_: cola.put((None, bytes(indata))))
+        except Exception as error:
+            raise VozNoDisponible("No se pudo abrir ningún micrófono: " + (errores[0] if errores else str(error))) from error
+        entradas[None] = _Entrada(None, int(flujo.samplerate))
+        flujos.append(flujo)
+
+    if al_evento:
+        nombres = [_nombre_dispositivo(i) for i in entradas]
+        if len(nombres) > 1:
+            mensaje = f"Escuchando en {len(nombres)} micrófonos a la vez ({', '.join(nombres)}): usaré el que te oiga. Habla ahora."
+        else:
+            mensaje = f"Micrófono activo: {nombres[0]} · habla ahora."
         print(f"[MICRÓFONO] {mensaje}")
         al_evento(mensaje)
 
-    detector = DetectorVoz(
-        umbral_minimo=max(6.0, config.VOZ_UMBRAL_RMS * 0.4),
-        silencio_final=config.VOZ_SILENCIO_FINAL_SEGUNDOS,
-        max_frase=config.VOZ_TIEMPO_MAX_FRASE_SEGUNDOS,
-    )
-    bloques, prebuffer, estado, hablaba = [], collections.deque(maxlen=10), "esperando", False
-    with flujo:
+    elegido = None
+    aviso_escucha = False
+    with contextlib.ExitStack() as pila:
+        for flujo in flujos:
+            pila.enter_context(flujo)
         while not (detener_evento and detener_evento.is_set()):
             try:
-                bloque = cola.get(timeout=0.2)
+                candidato, bloque = cola.get(timeout=0.2)
             except queue.Empty:
                 continue
-            muestras = np.frombuffer(bloque, dtype=np.int16)
-            if not len(muestras):
+            entrada = entradas.get(candidato)
+            if entrada is None or entrada.terminado:
                 continue
-            rms = float(np.sqrt(np.mean(muestras.astype(np.float32) ** 2)))
-            estado = detector.procesar(rms, len(muestras) / frecuencia)
-            if detector.hablando:
-                if not hablaba:
-                    bloques = list(prebuffer)  # conserva la primera sílaba de «Bark»
-                    if al_evento:
-                        al_evento("Te escucho…")
-                bloques.append(bloque)
-            else:
-                if hablaba:
-                    bloques = []  # ruido breve descartado
-                prebuffer.append(bloque)
-            hablaba = detector.hablando
+            estado = entrada.procesar(bloque)
+            if entrada.detector.hablando and not aviso_escucha and al_evento:
+                aviso_escucha = True
+                al_evento("Te escucho…" if len(entradas) == 1 else f"Te escucho por «{_nombre_dispositivo(candidato)}»…")
             if avisos:
                 print(f"[MICRÓFONO] {avisos.pop(0)}")
-            if estado in {"fin", "vacio"}:
+            if estado == "fin":
+                elegido = entrada
                 break
+            if estado == "vacio":
+                entrada.terminado = True
+                if all(e.terminado for e in entradas.values()):
+                    break
 
     if detener_evento and detener_evento.is_set():
         return ""  # al pulsar «detener» no se transcribe nada a medias
-    if not bloques:
-        if detector.pico < 1.5:
-            # Entrada sin señal: la siguiente escucha prueba otro micrófono.
-            if config.DISPOSITIVO_ENTRADA_VOZ is None:
-                _ultimo_microfono_automatico = flujo.device
-            if al_evento:
-                al_evento("El micrófono no entrega señal. Probaré con otra entrada o revisa el dispositivo seleccionado.")
-        elif config.DISPOSITIVO_ENTRADA_VOZ is None:
-            config.DISPOSITIVO_ENTRADA_VOZ = flujo.device  # tiene señal real: se queda fijo
+    if elegido is None or not elegido.bloques:
+        _escuchas_sin_voz += 1
+        picos = [e.pico_absoluto for e in entradas.values()]
+        if al_evento and picos and max(picos) == 0:
+            al_evento("Windows entrega silencio absoluto: el micrófono está silenciado, desactivado o bloqueado. "
+                      "Revisa la tecla de silencio, Configuración › Privacidad › Micrófono y Sonido › Grabación.")
+        elif al_evento and entradas and max(e.detector.pico for e in entradas.values()) < 1.5:
+            al_evento("El micrófono no entrega señal. Prueba otro en el selector o pulsa «Probar micrófono».")
+        # Un micrófono «confirmado» que deja de dar señal (p. ej. audífonos apagados) se vuelve a buscar.
+        if _microfono_confirmado is not None and _escuchas_sin_voz >= 2 and max(picos or [0]) < 3:
+            _microfono_confirmado = None
         return ""
-    if config.DISPOSITIVO_ENTRADA_VOZ is None:
-        config.DISPOSITIVO_ENTRADA_VOZ = flujo.device
-    audio = np.frombuffer(b"".join(bloques), dtype=np.int16).astype(np.float32) / 32768.0
-    audio = remuestrear(audio, frecuencia)
+    _escuchas_sin_voz = 0
+    if config.DISPOSITIVO_ENTRADA_VOZ is None and elegido.indice is not None and _microfono_confirmado != elegido.indice:
+        _recordar_microfono(elegido.indice)  # solo tras captar voz real, nunca por silencio
+        if al_evento and len(entradas) > 1:
+            al_evento(f"Micrófono elegido: {_nombre_dispositivo(elegido.indice)}. Lo usaré de aquí en adelante.")
+    audio = np.frombuffer(b"".join(elegido.bloques), dtype=np.int16).astype(np.float32) / 32768.0
+    audio = remuestrear(audio, elegido.frecuencia)
     if os.getenv("BARK_VOZ_DEBUG") == "1":  # guarda lo que realmente oyó Whisper
-        with wave.open(os.path.join(config.CARPETA_BASE, "resultados", "ultima_voz.wav"), "wb") as archivo:
+        with wave.open(os.path.join(config.CARPETA_BD, "ultima_voz.wav"), "wb") as archivo:
             archivo.setnchannels(1)
             archivo.setsampwidth(2)
             archivo.setframerate(FRECUENCIA_WHISPER)
@@ -462,21 +638,38 @@ def _escuchar_frase_whisper(detener_evento=None, al_parcial=None, al_evento=None
     return texto
 
 
-def _reproducir_wav(datos: bytes, prefijo: str) -> None:
-    """Reproduce bytes WAV y elimina el archivo temporal aun si falla Windows."""
-    descriptor, ruta_wav = tempfile.mkstemp(prefix=prefijo, suffix=".wav")
-    os.close(descriptor)
-    try:
-        with open(ruta_wav, "wb") as archivo_wav:
-            archivo_wav.write(datos)
-        winsound.PlaySound(ruta_wav, winsound.SND_FILENAME)
-    finally:
-        if os.path.exists(ruta_wav):
-            os.remove(ruta_wav)
+def _audio_de_bytes(datos: bytes, tipo_mime: str = "") -> tuple[np.ndarray, int]:
+    """WAV (OpenAI) o PCM crudo L16 (Gemini) → (audio int16 mono, frecuencia)."""
+    canales = 1
+    if datos[:4] == b"RIFF" and datos[8:12] == b"WAVE":
+        posicion, frecuencia, bits, inicio = 12, 24000, 16, None
+        while posicion + 8 <= len(datos):
+            ident = datos[posicion:posicion + 4]
+            tamano = int.from_bytes(datos[posicion + 4:posicion + 8], "little")
+            if ident == b"fmt ":
+                canales = int.from_bytes(datos[posicion + 10:posicion + 12], "little") or 1
+                frecuencia = int.from_bytes(datos[posicion + 12:posicion + 16], "little")
+                bits = int.from_bytes(datos[posicion + 22:posicion + 24], "little")
+            elif ident == b"data":
+                inicio = posicion + 8  # en streaming el tamaño puede venir como 0xFFFFFFFF
+                break
+            posicion += 8 + tamano + (tamano & 1)
+        if inicio is None or bits != 16:
+            raise ValueError("El audio WAV recibido no es PCM de 16 bits.")
+        crudo = datos[inicio:]
+    else:
+        coincidencia = re.search(r"rate=(\d+)", tipo_mime or "")
+        frecuencia = int(coincidencia.group(1)) if coincidencia else 24000
+        crudo = datos
+    ancho = 2 * canales
+    audio = np.frombuffer(crudo[:len(crudo) // ancho * ancho], dtype="<i2")
+    if canales > 1:
+        audio = audio.reshape(-1, canales).mean(axis=1)
+    return audio.astype(np.int16), frecuencia
 
 
-def _hablar_con_gemini(texto: str) -> None:
-    """Sintetiza texto con Gemini TTS y reproduce el WAV devuelto."""
+def _sintetizar_gemini(texto: str, espera: float | None = None) -> tuple[np.ndarray, int]:
+    """Sintetiza texto con Gemini TTS y devuelve el audio listo para reproducir."""
     if not config.GEMINI_API_KEY:
         raise requests.RequestException("Gemini no está configurado.")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{config.GEMINI_MODELO_TTS}:generateContent"
@@ -489,62 +682,190 @@ def _hablar_con_gemini(texto: str) -> None:
             "responseModalities": ["AUDIO"],
             "speechConfig": {"voiceConfig": {"voice": config.GEMINI_VOZ}},
         },
-    }, timeout=config.TIEMPO_ESPERA_VOZ_NUBE)
+    }, timeout=espera or config.TIEMPO_ESPERA_VOZ_NUBE)
     respuesta.raise_for_status()
     try:
-        datos = base64.b64decode(respuesta.json()["candidates"][0]["content"]["parts"][0]["inlineData"]["data"])
+        parte = respuesta.json()["candidates"][0]["content"]["parts"][0]["inlineData"]
+        return _audio_de_bytes(base64.b64decode(parte["data"]), parte.get("mimeType", ""))
     except (KeyError, IndexError, TypeError, ValueError) as error:
         raise requests.RequestException("Gemini no devolvió audio válido.") from error
-    _reproducir_wav(datos, "bark_gemini_")
 
 
-def _hablar_con_openai(texto: str) -> None:
-    """Sintetiza texto con OpenAI y reproduce el WAV devuelto."""
+def _sintetizar_openai(texto: str, espera: float | None = None) -> tuple[np.ndarray, int]:
+    """Sintetiza texto con OpenAI TTS y devuelve el audio listo para reproducir."""
     respuesta = _sesion_red().post("https://api.openai.com/v1/audio/speech", headers={
         "Authorization": f"Bearer {config.OPENAI_API_KEY}", "Content-Type": "application/json",
     }, json={
         "model": config.OPENAI_MODELO_TTS, "voice": config.OPENAI_VOZ,
         "input": texto[:1500], "response_format": "wav",
         "instructions": "Habla en español de México con una voz femenina, serena, cálida y natural.",
-    }, timeout=config.TIEMPO_ESPERA_VOZ_NUBE)
+    }, timeout=espera or config.TIEMPO_ESPERA_VOZ_NUBE)
     respuesta.raise_for_status()
-    _reproducir_wav(respuesta.content, "bark_openai_")
+    try:
+        return _audio_de_bytes(respuesta.content)
+    except ValueError as error:
+        raise requests.RequestException("OpenAI no devolvió audio válido.") from error
+
+
+def _motores_nube() -> list[tuple[str, object]]:
+    """Voces de nube configuradas y no pausadas, en el orden de preferencia elegido."""
+    motores = []
+    if config.MODO_VOZ in {"auto", "gemini"} and config.GEMINI_API_KEY:
+        motores.append(("Gemini", _sintetizar_gemini))
+    if config.MODO_VOZ in {"auto", "gemini", "openai"} and config.OPENAI_API_KEY:
+        motores.append(("OpenAI", _sintetizar_openai))
+    ahora = time.monotonic()
+    for nombre, _ in motores:
+        if ahora < _motores_nube_bloqueados_hasta[nombre]:
+            print(f"[VOZ] {nombre} está en pausa tras un fallo; usando el siguiente respaldo.")
+    return [(nombre, funcion) for nombre, funcion in motores if ahora >= _motores_nube_bloqueados_hasta[nombre]]
+
+
+def _pausar_motor(nombre: str, error: Exception) -> None:
+    # Una respuesta sin cuota/autorización o un timeout no se reintenta
+    # en cada frase. La próxima síntesis se desvía a los respaldos.
+    estado = getattr(getattr(error, "response", None), "status_code", None)
+    _motores_nube_bloqueados_hasta[nombre] = time.monotonic() + (120 if estado in {401, 403, 429} else 60)
+    if estado == 429:
+        print(f"[VOZ] {nombre} limitó las solicitudes; queda en pausa temporal.")
+    print(f"[VOZ] {nombre} no disponible; probando el siguiente respaldo: {error}")
+
+
+def partes_para_nube(frases: list[str]) -> list[str]:
+    """Primera frase sola (empieza a sonar enseguida) y el resto en un bloque.
+
+    Así la voz de nube arranca rápido como en los modos Live, sin multiplicar
+    las solicitudes (ni chocar con los límites por minuto de las APIs).
+    """
+    if len(frases) <= 1:
+        return list(frases)
+    return [frases[0], " ".join(frases[1:])]
 
 
 def hablar(texto: str) -> None:
-    """Gemini -> OpenAI -> Piper; un fallo de nube nunca detiene Bark."""
-    # Al elegir Gemini/auto se prueba Gemini primero. OpenAI es la segunda
-    # opción en auto y también el respaldo de Gemini cuando no haya cuota.
-    motores = []
-    if config.MODO_VOZ in {"auto", "gemini"}:
-        motores.append(("Gemini", _hablar_con_gemini, bool(config.GEMINI_API_KEY)))
-    if config.MODO_VOZ in {"auto", "gemini", "openai"}:
-        motores.append(("OpenAI", _hablar_con_openai, bool(config.OPENAI_API_KEY)))
-    for nombre, sintetizar, configurado in motores:
-        if not configurado:
-            continue
-        if time.monotonic() < _motores_nube_bloqueados_hasta[nombre]:
-            print(f"[VOZ] {nombre} está en pausa tras un fallo; usando el siguiente respaldo.")
-            continue
+    """Gemini → OpenAI → Piper en streaming; un fallo de nube nunca detiene Bark.
+
+    Mientras suena la primera frase se sintetiza el resto, el nivel de la voz se
+    publica para el orbe y ``audio_vivo.interrumpir()`` la corta al instante.
+    """
+    from nucleo import voz_local
+    motores = _motores_nube()
+    if not motores:
+        if config.MODO_VOZ != "local":
+            print("[VOZ] Las voces de nube no están disponibles; usando Piper local.")
         try:
-            sintetizar(texto)
-            return
-        except (requests.RequestException, OSError, RuntimeError) as error:
-            respuesta_error = getattr(error, "response", None)
-            estado = getattr(respuesta_error, "status_code", None)
-            # Una respuesta sin cuota/autorización o un timeout no se reintenta
-            # en cada frase. La próxima síntesis se desvía a los respaldos.
-            _motores_nube_bloqueados_hasta[nombre] = time.monotonic() + (120 if estado in {401, 403, 429} else 60)
-            if estado == 429:
-                print(f"[VOZ] {nombre} limitó las solicitudes; queda en pausa temporal.")
-            print(f"[VOZ] {nombre} no disponible; probando el siguiente respaldo: {error}")
-    if config.MODO_VOZ != "local":
-        print("[VOZ] Las voces de nube no están disponibles; usando Piper local.")
+            voz_local.hablar_local(texto)
+        except Exception as error:
+            print(f"[VOZ] No se pudo sintetizar la respuesta: {error}")
+        return
+    frases = voz_local.dividir_frases(voz_local.preparar_texto(texto))
+    if not frases:
+        return
+    with voz_local._bloqueo_reproduccion:
+        audio_vivo.INTERRUPCION.clear()
+        fin = threading.Event()
+        cola: queue.Queue = queue.Queue(maxsize=4)
+
+        def entregar(elemento) -> bool:
+            while not (fin.is_set() or audio_vivo.INTERRUPCION.is_set()):
+                try:
+                    cola.put(elemento, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def productor() -> None:
+            try:
+                for numero, parte in enumerate(partes_para_nube(frases)):
+                    if fin.is_set() or audio_vivo.INTERRUPCION.is_set():
+                        break
+                    audio = None
+                    while motores and audio is None:
+                        nombre, sintetizar = motores[0]
+                        try:
+                            # El resto se sintetiza mientras suena la primera frase: puede tardar más.
+                            audio = sintetizar(parte, config.TIEMPO_ESPERA_VOZ_NUBE * (1 if numero == 0 else 2.5))
+                        except (requests.RequestException, OSError, RuntimeError, ValueError) as error:
+                            _pausar_motor(nombre, error)
+                            motores.pop(0)
+                    if audio is not None:
+                        if not entregar((audio[0], audio[1], 0.22)):
+                            break
+                        continue
+                    for frase in voz_local.dividir_frases(parte):  # ninguna nube respondió: Piper
+                        if fin.is_set() or audio_vivo.INTERRUPCION.is_set():
+                            break
+                        audio_local, frecuencia = voz_local.sintetizar(frase)
+                        if not entregar((audio_local, frecuencia, voz_local._pausa_despues(frase))):
+                            break
+            except Exception as error:
+                entregar(error)
+            finally:
+                entregar(None)
+
+        threading.Thread(target=productor, name="bark-tts-nube", daemon=True).start()
+        salida = voz_local._Salida()
+        try:
+            while not audio_vivo.INTERRUPCION.is_set():
+                try:
+                    elemento = cola.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if elemento is None:
+                    break
+                if isinstance(elemento, Exception):
+                    print(f"[VOZ] No se pudo sintetizar la respuesta: {elemento}")
+                    break
+                salida.escribir(*elemento)
+        finally:
+            fin.set()
+            salida.cerrar()
+
+
+def _vigilar_interrupcion(detener: threading.Event) -> None:
+    """Mientras Bark habla, si tú hablas fuerte por encima de su voz, lo interrumpe.
+
+    Sin cancelación de eco el micrófono también oye a Bark por los altavoces; por
+    eso el umbral es alto y la opción es voluntaria: funciona mejor con audífonos.
+    """
     try:
-        from nucleo import voz_local
-        voz_local.hablar_local(texto)
-    except Exception as error:
-        print(f"[VOZ] No se pudo sintetizar la respuesta: {error}")
+        indices = _microfonos_a_escuchar()
+        cola: queue.Queue = queue.Queue()
+        flujo = _abrir_flujo(indices[0] if indices else None, lambda indata, *_: cola.put(bytes(indata)))
+    except Exception:
+        return
+    seguidos = 0
+    with flujo:
+        while not detener.is_set():
+            try:
+                bloque = cola.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            muestras = np.frombuffer(bloque, dtype=np.int16).astype(np.float32)
+            rms = float(np.sqrt(np.mean(muestras ** 2))) if len(muestras) else 0.0
+            seguidos = seguidos + 1 if rms >= config.VOZ_UMBRAL_INTERRUPCION else 0
+            if seguidos >= 5:  # ~0.3 s de voz fuerte y continua, no un golpe
+                print("[VOZ] Te oí hablar: interrumpo la respuesta.")
+                audio_vivo.interrumpir()
+                return
+
+
+def hablar_interrumpible(texto: str) -> bool:
+    """Habla y, si está activado, escucha a la vez para dejarte interrumpir. True si lo interrumpiste."""
+    inicio = time.monotonic()
+    vigia_detener = threading.Event()
+    vigia = None
+    if config.INTERRUMPIR_CON_VOZ:
+        vigia = threading.Thread(target=_vigilar_interrupcion, args=(vigia_detener,), name="bark-vigia", daemon=True)
+        vigia.start()
+    try:
+        hablar(texto)
+    finally:
+        vigia_detener.set()
+        if vigia is not None:
+            vigia.join(timeout=1.0)  # libera el micrófono antes de volver a escuchar
+    return audio_vivo.interrumpido_desde(inicio)
 
 
 def escuchar_frase(detener_evento=None, al_parcial=None, al_evento=None) -> str:
@@ -553,14 +874,36 @@ def escuchar_frase(detener_evento=None, al_parcial=None, al_evento=None) -> str:
     return _escuchar_frase_whisper(detener_evento, al_parcial, al_evento)
 
 
+_AFIRMACIONES = {"si", "autorizo", "confirmo", "adelante", "claro", "dale", "hazlo", "ok", "okay", "va",
+                 "sale", "correcto", "afirmativo", "procede", "acepto", "permitido", "permito"}
+_NEGACIONES = {"no", "cancela", "cancelar", "nunca", "negativo", "detente", "alto"}
+
+
+def es_afirmacion(texto: str):
+    """True = sí, False = no, None = no se entendió. Tolera «Sí.», «sí, adelante», «claro que sí»."""
+    palabras = re.findall(r"[a-zñ]+", _sin_acentos(texto or "").lower())
+    if not palabras:
+        return None
+    if any(p in _NEGACIONES for p in palabras[:4]):
+        return False
+    if any(p in _AFIRMACIONES for p in palabras[:4]):
+        return True
+    return None
+
+
 def solicitar_permiso_por_voz(descripcion: str) -> bool:
-    """Solicita una autorización inequívoca antes de una acción sensible."""
+    """Solicita una autorización inequívoca antes de una acción sensible (dos intentos)."""
     print(f"[PERMISO POR VOZ] Bark quiere: {descripcion}")
-    hablar("Esta acción requiere autorización. Responde sí para autorizar o no para cancelar.")
-    respuesta = escuchar_frase().lower().strip()
-    autorizado = respuesta in {"si", "sí", "autorizo", "confirmo", "adelante"}
-    hablar("Autorizado." if autorizado else "Acción cancelada.")
-    return autorizado
+    hablar(f"Necesito tu permiso para {descripcion}. ¿Lo autorizas? Responde sí o no.")
+    for intento in range(2):
+        decision = es_afirmacion(escuchar_frase())
+        if decision is not None:
+            hablar("Autorizado." if decision else "Acción cancelada.")
+            return decision
+        if intento == 0:
+            hablar("No te entendí. Di sí para autorizar o no para cancelar.")
+    hablar("No escuché una respuesta clara; la acción se cancela.")
+    return False
 
 
 def _extraer_orden_activacion(frase: str, requiere_inicio: bool = False) -> str | None:
@@ -633,7 +976,9 @@ def ejecutar_modo_voz(procesar_mensaje, al_estado=None, detener_evento=None, al_
             frase = escuchar_frase(detener_evento, al_evento=al_evento)
         except VozNoDisponible as error:
             print(f"[VOZ] {error}")
-            hablar("No pude abrir el micrófono. Revisa el dispositivo de entrada.")
+            if al_evento:
+                al_evento(str(error))
+            hablar("No pude usar el micrófono. Te dejé el motivo en pantalla.")
             return
         if not frase:
             # Un periodo sin voz no debe apagar el asistente.
@@ -690,4 +1035,5 @@ def ejecutar_modo_voz(procesar_mensaje, al_estado=None, detener_evento=None, al_
             al_respuesta(respuesta)
         if al_estado:
             al_estado("hablando")
-        hablar(respuesta)
+        if hablar_interrumpible(respuesta) and al_evento:
+            al_evento("Interrumpido. Te escucho.")

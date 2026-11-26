@@ -74,6 +74,47 @@ def clima(ciudad: str = "", dia: str = "hoy") -> str:
             f"viento {a['wind_speed_10m']:.0f} km/h. {pronostico}")
 
 
+def icono_clima(codigo: int) -> str:
+    """Código WMO de Open-Meteo → símbolo para el HUD."""
+    if codigo in (0, 1):
+        return "☀"
+    if codigo in (2, 3):
+        return "☁"
+    if codigo in (45, 48):
+        return "≋"
+    if codigo in (71, 73, 75, 77, 85, 86):
+        return "❄"
+    if codigo >= 95:
+        return "ϟ"
+    return "☂"
+
+
+def clima_datos(ciudad: str = "") -> dict | None:
+    """Clima actual y 3 días como datos (para el panel de la interfaz). None si no hay red o ciudad."""
+    ciudad = ciudad.strip() or _ciudad_por_defecto()
+    if not ciudad:
+        return None
+    lugar = _ubicar(ciudad)
+    if not lugar:
+        return None
+    d = http_json("https://api.open-meteo.com/v1/forecast", {
+        "latitude": lugar["latitude"], "longitude": lugar["longitude"], "timezone": "auto", "forecast_days": 3,
+        "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
+        "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code",
+    })
+    actual, diario = d["current"], d["daily"]
+    return {
+        "ciudad": lugar["name"], "region": lugar.get("admin1") or lugar.get("country", ""),
+        "temperatura": actual["temperature_2m"], "sensacion": actual["apparent_temperature"],
+        "humedad": actual["relative_humidity_2m"], "viento": actual["wind_speed_10m"],
+        "codigo": actual["weather_code"], "descripcion": _CLIMA.get(actual["weather_code"], "variable"),
+        "icono": icono_clima(actual["weather_code"]),
+        "dias": [{"nombre": nombre, "maxima": diario["temperature_2m_max"][i], "minima": diario["temperature_2m_min"][i],
+                  "lluvia": diario["precipitation_probability_max"][i] or 0, "icono": icono_clima(diario["weather_code"][i])}
+                 for i, nombre in enumerate(("Hoy", "Mañana", "Pasado"))],
+    }
+
+
 _MONEDAS = {
     "USD": ("dolar", "dolares", "dolar americano", "usd", "verdes"), "MXN": ("peso", "pesos", "peso mexicano", "mxn"),
     "EUR": ("euro", "euros", "eur"), "GBP": ("libra", "libras", "libra esterlina", "gbp"), "JPY": ("yen", "yenes", "jpy"),

@@ -321,3 +321,18 @@ class TestBucleConSugerencias(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestInicioWindows(unittest.TestCase):
+    def test_elige_varios_elementos_con_nombres_aproximados(self):
+        from acciones.comandos import _elegir_elementos_inicio
+        entradas = [{"id": str(i), "nombre": n} for i, n in enumerate(["Discord", "Steam", "SteamWebHelper", "Spotify", "OneDrive"])]
+        elegidos, dudas = _elegir_elementos_inicio("discord, spotifi y one drive", entradas)
+        self.assertEqual([e["nombre"] for e in elegidos], ["Discord", "Spotify", "OneDrive"])
+        self.assertEqual(dudas, [])
+        _, dudas = _elegir_elementos_inicio("zzzz", entradas)
+        self.assertTrue(dudas)
+
+    def test_rutas_de_inicio(self):
+        self.assertEqual(_accion_directa("reactiva al inicio Discord"), ("reactivar_elemento_inicio", {"nombre": "discord"}))
+        self.assertEqual(_accion_directa("desactiva al inicio discord y steam"), ("desactivar_elemento_inicio", {"nombre": "discord y steam"}))

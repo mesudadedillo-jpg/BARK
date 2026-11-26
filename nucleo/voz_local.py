@@ -24,13 +24,16 @@ import wave
 import numpy as np
 
 from config import config
+from nucleo import audio_vivo
 
 _voz = None
 _ruta_cargada = None
 _cfg_sintesis = None
 _bloqueo_carga = threading.Lock()
-_bloqueo_reproduccion = threading.Lock()  # dos respuestas nunca se solapan
-_interrumpir = threading.Event()
+# Reentrante: la cadena de voces de nube puede caer a Piper sin soltar el turno.
+_bloqueo_reproduccion = threading.RLock()  # dos respuestas nunca se solapan
+# Compartido con la interfaz y las voces de nube: interrumpir corta cualquier voz.
+_interrumpir = audio_vivo.INTERRUPCION
 
 
 # ============================================================
@@ -67,7 +70,7 @@ def precargar() -> None:
 
 def detener_voz() -> None:
     """Corta la locución en curso (la interfaz puede llamarlo al pulsar «detener»)."""
-    _interrumpir.set()
+    audio_vivo.interrumpir()
 
 
 def _configuracion():
@@ -227,7 +230,21 @@ class _Salida:
             self._respaldo = True
             self._frecuencia = frecuencia
 
+    def _cambiar_frecuencia(self, frecuencia: int) -> None:
+        """Gemini (24 kHz) y Piper (22 kHz) pueden turnarse en una misma respuesta."""
+        if self._frecuencia in (None, frecuencia):
+            return
+        if self._flujo is not None:
+            try:
+                self._flujo.stop()
+            finally:
+                self._flujo.close()
+            self._flujo = None
+        elif self._respaldo:
+            self._reproducir_respaldo()
+
     def escribir(self, audio: np.ndarray, frecuencia: int, pausa: float) -> None:
+        self._cambiar_frecuencia(frecuencia)
         self._abrir(frecuencia)
         volumen = float(np.clip(config.VOZ_VOLUMEN, 0.0, 1.0))
         datos = np.concatenate([(audio.astype(np.float32) * volumen).astype(np.int16),
@@ -235,19 +252,17 @@ class _Salida:
         if self._respaldo:
             self._acumulado.append(datos)
             return
-        paso = max(1, frecuencia // 4)  # trozos de 0.25 s para poder interrumpir
+        # Trozos de 40 ms: la interrupción es inmediata y el orbe sigue la voz con fluidez.
+        paso = max(1, frecuencia // 25)
         for inicio in range(0, len(datos), paso):
             if _interrumpir.is_set():
                 return
-            self._flujo.write(datos[inicio:inicio + paso].reshape(-1, 1))
+            trozo = datos[inicio:inicio + paso]
+            audio_vivo.reportar_bloque("salida", trozo)
+            self._flujo.write(trozo.reshape(-1, 1))
 
-    def cerrar(self) -> None:
-        if self._flujo is not None:
-            try:
-                self._flujo.stop()  # espera a que termine de sonar lo ya enviado
-            finally:
-                self._flujo.close()
-        elif self._respaldo and self._acumulado and not _interrumpir.is_set():
+    def _reproducir_respaldo(self) -> None:
+        if self._acumulado and not _interrumpir.is_set():
             import winsound
             memoria = io.BytesIO()
             with wave.open(memoria, "wb") as destino:
@@ -256,6 +271,22 @@ class _Salida:
                 destino.setframerate(self._frecuencia)
                 destino.writeframes(np.concatenate(self._acumulado).tobytes())
             winsound.PlaySound(memoria.getvalue(), winsound.SND_MEMORY)
+        self._acumulado = []
+
+    def cerrar(self) -> None:
+        try:
+            if self._flujo is not None:
+                try:
+                    if _interrumpir.is_set():
+                        self._flujo.abort()  # interrumpido: se calla ya, sin terminar el búfer
+                    else:
+                        self._flujo.stop()  # espera a que termine de sonar lo ya enviado
+                finally:
+                    self._flujo.close()
+            elif self._respaldo:
+                self._reproducir_respaldo()
+        finally:
+            audio_vivo.reportar("salida", 0.0)
 
 
 def hablar_local(texto: str) -> None:

@@ -106,7 +106,10 @@ h(comandos.diagnosticar_equipo, "optimizacion", "Revisa RAM, disco y procesos si
 h(comandos.diagnosticar_ram_avanzado, "optimizacion", "Procesos que más RAM consumen", palabras=("ram", "memoria", "consume"))
 h(comandos.liberar_ram_avanzada, "optimizacion", "Libera RAM sin cerrar programas", palabras=("libera", "ram"), sensible=True)
 h(comandos.listar_elementos_inicio, "optimizacion", "Programas y tareas que arrancan con Windows", palabras=("inicio", "arranque"))
-h(comandos.desactivar_elemento_inicio, "optimizacion", "Desactiva una entrada de inicio sin desinstalar", palabras=("inicio", "desactiva"), sensible=True)
+h(comandos.desactivar_elemento_inicio, "optimizacion", "Desactiva uno o varios programas de inicio (nombres aproximados, separados por coma); reversible",
+  alias=("quitar_del_inicio",), palabras=("inicio", "desactiva", "arranque", "encender"), sensible=True)
+h(comandos.reactivar_elemento_inicio, "optimizacion", "Vuelve a activar programas de inicio desactivados",
+  alias=("activar_al_inicio",), palabras=("inicio", "reactiva", "activa", "arranque"), sensible=True)
 h(comandos.resumen_optimizacion, "optimizacion", "Analiza qué se puede optimizar sin cambiar nada", palabras=("optimizacion", "analiza"))
 h(comandos.limpiar_temporales_usuario, "optimizacion", "Limpia archivos temporales del usuario", palabras=("temporales", "limpia", "espacio"), sensible=True)
 h(sistema.optimizar_pc, "optimizacion", "Optimización completa: RAM, temporales, DNS y recomendaciones",
