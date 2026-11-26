@@ -35,7 +35,8 @@ HERRAMIENTA = {
         "Ejecuta una acción real en la PC del usuario o consulta datos locales o de internet mediante el agente Bark: "
         "abrir o cerrar programas, volumen y brillo, música y videos, buscar y mover archivos, clima y pronóstico, "
         "notas, pendientes, agenda y recordatorios, WhatsApp y correo, diagnóstico y optimización del equipo, red y Wi-Fi, "
-        "instalar programas, tipo de cambio, noticias, Wikipedia y lo que recuerdes del usuario. "
+        "instalar programas, tipo de cambio, noticias, Wikipedia y lo que recuerdes del usuario; también instalar "
+        "conectores (ElevenLabs, GitHub, archivos, web o cualquier servidor MCP) y guardar habilidades/prompts reutilizables. "
         "Úsala siempre que el usuario pida hacer o consultar algo de su equipo; nunca finjas haberlo hecho."
     ),
     "parameters": {
@@ -60,6 +61,13 @@ def instrucciones_sistema() -> str:
         personalidad = "Eres Bark, un asistente de IA que vive en la PC del usuario."
     ahora = datetime.now()
     ciudad = os.getenv("BARK_CIUDAD", "").strip()
+    try:
+        from conectores import habilidades
+        guardadas = habilidades.cargar()
+    except Exception:
+        guardadas = {}
+    texto_habilidades = "".join(
+        f"\n- {n} (cuando: {h.get('cuando_usar') or n}): {h.get('instrucciones', '')[:400]}" for n, h in list(guardadas.items())[:6])
     return (
         f"{personalidad}\n\n"
         "MODO DE VOZ EN TIEMPO REAL:\n"
@@ -69,6 +77,7 @@ def instrucciones_sistema() -> str:
         "cuenta el resultado en una o dos frases. Mientras esperas puedes decir algo breve como «dame un segundo».\n"
         "- Si te interrumpen, detente y atiende lo nuevo.\n"
         f"- Fecha y hora actuales: {ahora:%A %d/%m/%Y %H:%M}." + (f" Ciudad del usuario: {ciudad}." if ciudad else "")
+        + (f"\n\nHABILIDADES DEL USUARIO (aplícalas cuando vengan al caso):{texto_habilidades}" if texto_habilidades else "")
     )
 
 

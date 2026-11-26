@@ -642,7 +642,7 @@ def _audio_de_bytes(datos: bytes, tipo_mime: str = "") -> tuple[np.ndarray, int]
     """WAV (OpenAI) o PCM crudo L16 (Gemini) → (audio int16 mono, frecuencia)."""
     canales = 1
     if datos[:4] == b"RIFF" and datos[8:12] == b"WAVE":
-        posicion, frecuencia, bits, inicio = 12, 24000, 16, None
+        posicion, frecuencia, bits, inicio, largo = 12, 24000, 16, None, 0
         while posicion + 8 <= len(datos):
             ident = datos[posicion:posicion + 4]
             tamano = int.from_bytes(datos[posicion + 4:posicion + 8], "little")
@@ -651,12 +651,16 @@ def _audio_de_bytes(datos: bytes, tipo_mime: str = "") -> tuple[np.ndarray, int]
                 frecuencia = int.from_bytes(datos[posicion + 12:posicion + 16], "little")
                 bits = int.from_bytes(datos[posicion + 22:posicion + 24], "little")
             elif ident == b"data":
-                inicio = posicion + 8  # en streaming el tamaño puede venir como 0xFFFFFFFF
+                inicio, largo = posicion + 8, tamano
                 break
             posicion += 8 + tamano + (tamano & 1)
         if inicio is None or bits != 16:
             raise ValueError("El audio WAV recibido no es PCM de 16 bits.")
-        crudo = datos[inicio:]
+        # Gemini agrega metadatos después del audio («trainedAlgorithmicMedia»): leerlos
+        # como sonido producía una ráfaga de estática al final. Se respeta el tamaño
+        # declarado; solo en streaming (0 o 0xFFFFFFFF, o más que el archivo) se lee hasta el final.
+        fin = inicio + largo if 0 < largo < 0xFFFFFFFF and inicio + largo <= len(datos) else len(datos)
+        crudo = datos[inicio:fin]
     else:
         coincidencia = re.search(r"rate=(\d+)", tipo_mime or "")
         frecuencia = int(coincidencia.group(1)) if coincidencia else 24000
@@ -666,6 +670,16 @@ def _audio_de_bytes(datos: bytes, tipo_mime: str = "") -> tuple[np.ndarray, int]
     if canales > 1:
         audio = audio.reshape(-1, canales).mean(axis=1)
     return audio.astype(np.int16), frecuencia
+
+
+def _suavizar_final(audio: np.ndarray, frecuencia: int, segundos: float = 0.012) -> np.ndarray:
+    """Desvanece los últimos milisegundos: el corte de la voz nunca suena como un clic."""
+    muestras = min(len(audio), int(frecuencia * segundos))
+    if muestras < 2:
+        return audio
+    salida = audio.astype(np.float32)
+    salida[-muestras:] *= np.linspace(1.0, 0.0, muestras, dtype=np.float32)
+    return salida.astype(np.int16)
 
 
 def _sintetizar_gemini(texto: str, espera: float | None = None) -> tuple[np.ndarray, int]:
@@ -790,7 +804,7 @@ def hablar(texto: str) -> None:
                             _pausar_motor(nombre, error)
                             motores.pop(0)
                     if audio is not None:
-                        if not entregar((audio[0], audio[1], 0.22)):
+                        if not entregar((_suavizar_final(audio[0], audio[1]), audio[1], 0.22)):
                             break
                         continue
                     for frase in voz_local.dividir_frases(parte):  # ninguna nube respondió: Piper

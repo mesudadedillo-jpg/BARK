@@ -39,6 +39,15 @@ class TestAudioDeNube(unittest.TestCase):
         audio, frecuencia = escuchar._audio_de_bytes(bytes(datos))
         self.assertEqual((len(audio), frecuencia), (50, 22050))
 
+    def test_metadatos_despues_del_audio_no_suenan(self):
+        # Gemini manda el WAV con un bloque de metadatos al final; antes se leía como estática.
+        voz = (np.sin(np.linspace(0, 300, 2400)) * 3000).astype(np.int16)
+        metadatos = b"http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"
+        bloque = b"LIST" + len(metadatos).to_bytes(4, "little") + metadatos
+        audio, frecuencia = escuchar._audio_de_bytes(_wav(voz, 24000) + bloque, "audio/wav")
+        self.assertEqual((len(audio), frecuencia), (2400, 24000))
+        self.assertTrue(np.array_equal(audio, voz))
+
     def test_wav_estereo_se_mezcla_a_mono(self):
         estereo = np.array([100, 300, 100, 300], dtype=np.int16)
         audio, _ = escuchar._audio_de_bytes(_wav(estereo, 16000, canales=2))
@@ -181,6 +190,60 @@ class TestMedios(unittest.TestCase):
         self.assertAlmostEqual(medios.posicion_actual(sonando), 15.0, delta=0.5)
         self.assertEqual(medios.posicion_actual({**sonando, "reproduciendo": False}), 5.0)
         self.assertEqual(medios.posicion_actual({**sonando, "duracion": 8.0}), 8.0)
+
+
+class TestVideo(unittest.TestCase):
+    def test_tipo_de_medio(self):
+        self.assertEqual(medios.tipo_medio({"app_id": "Brave"}), "video_web")
+        self.assertEqual(medios.tipo_medio({"app_id": "308046B0AF4A39CB"}), "video_web")
+        self.assertEqual(medios.tipo_medio({"app_id": "vlc.exe"}), "video")
+        self.assertEqual(medios.tipo_medio({"app_id": "Spotify.exe"}), "audio")
+        self.assertEqual(medios.tipo_medio(None), "audio")
+
+    def test_opciones_segun_lo_que_suena(self):
+        web = [a for a, _ in medios.opciones_ventana({"app_id": "chrome"})]
+        self.assertEqual(web[:3], ["pantalla_completa", "mini", "salir_pantalla_completa"])
+        musica = [a for a, _ in medios.opciones_ventana({"app_id": "Spotify.exe"})]
+        self.assertNotIn("pantalla_completa", musica)
+        self.assertIn("maximizar", musica)
+
+    def test_sin_ventana_no_pulsa_teclas(self):
+        with patch.object(medios, "_buscar_ventana", return_value=(None, "", False)), patch.object(medios, "_pulsar") as pulsar:
+            self.assertIn("No encontré", medios.ajustar_ventana_reproductor({"app_id": "brave"}, "pantalla_completa"))
+        pulsar.assert_not_called()
+
+    def test_video_en_otra_pestana_no_pulsa_teclas(self):
+        with patch.object(medios, "_buscar_ventana", return_value=(123, "Otra página - Brave", False)),              patch.object(medios, "_enfocar", return_value=True), patch.object(medios, "_pulsar") as pulsar:
+            self.assertIn("otra pestaña", medios.ajustar_ventana_reproductor({"app_id": "brave"}, "pantalla_completa"))
+        pulsar.assert_not_called()
+
+    def test_pantalla_completa_del_video_usa_f(self):
+        with patch.object(medios, "_buscar_ventana", return_value=(123, "Video - YouTube - Brave", True)),              patch.object(medios, "_enfocar", return_value=True), patch.object(medios, "_pulsar") as pulsar,              patch.object(medios.time, "sleep"):
+            medios.ajustar_ventana_reproductor({"app_id": "brave"}, "pantalla_completa")
+            medios.ajustar_ventana_reproductor({"app_id": "brave"}, "mini")
+        self.assertEqual([c.args[0] for c in pulsar.call_args_list], [0x46, 0x49])
+
+
+class TestBurbuja(unittest.TestCase):
+    def test_burbuja_aparece_y_se_limpia(self):
+        import tkinter as tk
+        from interfaz.hud import burbuja_en_boton
+        try:
+            raiz = tk.Tk()
+        except tk.TclError:
+            self.skipTest("sin pantalla")
+        raiz.withdraw()
+        boton = tk.Button(raiz, text="Prueba", width=12)
+        boton.pack()
+        raiz.update()
+        burbuja_en_boton(boton, 10, 5)
+        self.assertEqual([type(h).__name__ for h in raiz.winfo_children()], ["Button", "Canvas"])
+        limite = time.monotonic() + 2
+        while len(raiz.winfo_children()) > 1 and time.monotonic() < limite:
+            raiz.update()
+            time.sleep(0.01)
+        self.assertEqual(len(raiz.winfo_children()), 1, "la capa de la burbuja debe desaparecer")
+        raiz.destroy()
 
 
 class TestHud(unittest.TestCase):
