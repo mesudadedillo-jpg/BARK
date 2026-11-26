@@ -224,6 +224,31 @@ def _cargar_personalidad() -> str:
         return "Eres Bark, un asistente de IA útil y directo."
 
 
+def razonamiento_activo() -> bool:
+    """El plan breve se pide salvo que el único cerebro sea un modelo local que ya piensa solo."""
+    if config.RAZONAMIENTO in {"0", "no", "off", "false"}:
+        return False
+    if config.RAZONAMIENTO in {"1", "si", "sí", "on", "true"}:
+        return True
+    solo_local = config.PROVEEDOR_PREFERIDO == "local" or not (config.GEMINI_API_KEY or config.OPENAI_API_KEY)
+    modelo = config.NOMBRE_MODELO.lower()
+    piensa_solo = any(marca in modelo for marca in ("qwen3", "deepseek-r1", "r1-distill", "qwq"))
+    return not (solo_local and piensa_solo)
+
+
+_GUIA_RAZONAR = """
+PIENSA ANTES DE ACTUAR: si la petición tiene varios pasos, es ambigua o hay que elegir herramienta, empieza el JSON
+con "plan": 1-2 frases cortas (qué quiere el usuario, qué herramientas y en qué orden). Si es trivial, omítelo.
+Ej: {"plan":"Quiere música: abro Spotify y luego busco Daft Punk.","tipo":"accion","herramienta":"abrir_aplicacion","parametros":{"nombre_app":"spotify"},"continuar":true}"""
+
+_GUIA_PASOS = """
+Si tu acción es solo un paso de varios, añade "continuar":true: verás el resultado y decidirás el siguiente paso.
+CONECTORES: para conectar un servicio (ElevenLabs, GitHub, archivos, web…) usa catalogo_conectores e instalar_conector;
+para cualquier otro servidor MCP usa agregar_conector_mcp. Las claves las pone el usuario en ⚙ Ajustes: nunca las pidas por el chat.
+HABILIDADES: si te piden crear un prompt o «recordar cómo hacer algo», redacta instrucciones claras (objetivo, pasos,
+formato de salida, un ejemplo) y guárdalas con crear_habilidad; las HABILIDADES DEL USUARIO que lleguen, síguelas."""
+
+
 def _construir_system_prompt() -> str:
     """Prompt breve y fijo: los comandos frecuentes ya se resuelven sin LLM.
 
@@ -246,7 +271,8 @@ Usa solo herramientas de la lista HERRAMIENTAS que llega después, con su nombre
 Si ninguna encaja, llama buscar_herramientas(consulta) antes de rendirte; si tampoco hay, dilo con honestidad.
 Los nombres aproximados están bien (apps, archivos, carpetas, contactos, redes Wi-Fi, sitios): Bark busca el más parecido.
 Para abrir cualquier programa usa abrir_aplicacion con el nombre hablado tal cual.
-Las herramientas marcadas [pide permiso] preguntan solas al usuario; no pidas confirmación tú."""
+Las herramientas marcadas [pide permiso] preguntan solas al usuario; no pidas confirmación tú.""" + _GUIA_PASOS + (
+        _GUIA_RAZONAR if razonamiento_activo() else "")
 
 
 def _herramientas_para(mensaje: str, contexto: str = "", modo_ingenieria: bool = False) -> list:
@@ -534,11 +560,19 @@ def _accion_conectores(mensaje: str, texto: str):
     mensaje = mensaje.strip(" .,;!?¿¡\n\t")
     texto = _normalizar(mensaje)
 
-    # Núcleo
+    # Núcleo (el catálogo va antes: «qué conectores puedes instalar» no es «qué conectores tienes»)
+    if re.search(r"\b(?:que|cuales)\s+conectores\s+(?:puedes|sabes)\s+(?:instalar|agregar|conectar)\b|\bcatalogo de conectores\b", texto):
+        return "catalogo_conectores", {}
     if re.search(r"\b(?:conectores|integraciones)\b", texto) and re.search(r"\b(?:que|cuales|muestra|lista|ver|tus|mis)\b", texto):
         return "listar_conectores", {}
     if re.search(r"\b(?:recarga|reconecta|actualiza)\b.*\b(?:conectores|mcp)\b", texto):
         return "recargar_conectores_mcp", {}
+    conectar = re.search(r"^(?:conecta(?:te)?|instala(?:r)?\s+el\s+conector(?:\s+de)?|agrega\s+el\s+conector(?:\s+de)?)\s+(?:con\s+|a\s+)?([a-z0-9 ]{3,30})$", texto)
+    if conectar and not re.search(r"\b(?:wifi|wi fi|red|bluetooth|internet)\b", conectar.group(1)):
+        from conectores import creador
+        # Solo si es un conector conocido: «conéctate a Totalplay» sigue siendo una red Wi-Fi.
+        if creador._buscar_receta(conectar.group(1).strip()):
+            return "instalar_conector", {"nombre": conectar.group(1).strip()}
 
     # Clima
     if re.search(r"\b(?:clima|pronostico|va a llover|llovera|hara (?:frio|calor)|que temperatura hace)\b|\bque tiempo hace\b", texto) \
@@ -971,6 +1005,13 @@ def procesar_mensaje(mensaje_usuario: str, max_iteraciones: int = None) -> str:
     mensajes = [{"role": "system", "content": _construir_system_prompt()},
                 {"role": "system", "content": _mensaje_herramientas(mensaje_usuario, ultimo_usuario, modo_ingenieria)}]
     # Al proveedor de nube solo se le dan recuerdos no sensibles y relevantes.
+    try:
+        from conectores import habilidades
+        contexto_habilidades = habilidades.contexto_para(mensaje_usuario)
+    except Exception:
+        contexto_habilidades = ""
+    if contexto_habilidades:
+        mensajes.append({"role": "system", "content": contexto_habilidades})
     recuerdos = _formatear_recuerdos(mensaje_usuario, incluir_sensibles=False)
     if not recuerdos.startswith("No hay"):
         mensajes.append({"role": "system", "content": f"MEMORIA PERSONAL RELEVANTE:\n{recuerdos}"})
@@ -979,6 +1020,7 @@ def procesar_mensaje(mensaje_usuario: str, max_iteraciones: int = None) -> str:
     mensajes.append({"role": "user", "content": mensaje_usuario})
 
     observaciones = 0
+    pasos_encadenados = 0
     respuesta_final_texto = None
 
     for iteracion in range(limite):
@@ -999,6 +1041,9 @@ def procesar_mensaje(mensaje_usuario: str, max_iteraciones: int = None) -> str:
             })
             continue
 
+        if decision.get("plan"):
+            print(f"[PLAN] {str(decision['plan'])[:300]}")  # el razonamiento breve no se muestra al usuario
+
         if decision.get("tipo") == "respuesta_final":
             respuesta_final_texto = decision.get("mensaje", "Tarea completada.")
             break
@@ -1010,10 +1055,13 @@ def procesar_mensaje(mensaje_usuario: str, max_iteraciones: int = None) -> str:
             resultado = REGISTRO.ejecutar(nombre_herramienta, parametros, _solicitador_permiso)
             # Vuelve al modelo cuando la herramienta no existía (con sugerencias), faltaban
             # datos, era buscar_herramientas, o es un paso de una tarea de código.
+            # «continuar»: el modelo pidió ver el resultado para dar el siguiente paso de su plan.
+            continuar = bool(decision.get("continuar")) and resultado.ok and pasos_encadenados < config.MAX_PASOS_ENCADENADOS
             encadenar = (resultado.observar and observaciones < MAX_OBSERVACIONES) or (
-                modo_ingenieria and resultado.herramienta in herramientas_ingenieria)
+                modo_ingenieria and resultado.herramienta in herramientas_ingenieria) or continuar
             if encadenar:
                 observaciones += 1
+                pasos_encadenados += int(continuar)
                 mensajes.append({"role": "assistant", "content": respuesta_llm})
                 mensajes.append({
                     "role": "user",
@@ -1072,7 +1120,12 @@ def _llamar_modelo_local(mensajes) -> str:
 def _parsear_respuesta_json(texto: str):
     """Intenta convertir la respuesta del LLM en un diccionario JSON."""
     try:
-        texto = texto.strip()
+        texto = (texto or "").strip()
+        # Un bloque ```json … ``` es inequívoco: se rescata sin gastar otra llamada. JSON mezclado con
+        # prosa se sigue rechazando a propósito (podría ser un ejemplo, no una orden).
+        bloque = re.fullmatch(r"```(?:json)?\s*(\{.*\})\s*```", texto, flags=re.S)
+        if bloque:
+            texto = bloque.group(1)
         if not (texto.startswith("{") and texto.endswith("}")):
             return None
         decision = json.loads(texto)

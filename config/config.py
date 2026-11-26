@@ -22,6 +22,35 @@ def _cargar_env_local() -> None:
             os.environ.setdefault(clave.strip(), valor.strip().strip('"').strip("'"))
 
 
+RUTA_ENV = Path(__file__).resolve().parent.parent / ".env"
+
+
+def guardar_en_env(valores: dict[str, str], ruta: Path | None = None) -> None:
+    """Escribe claves en .env sin tocar comentarios ni otras variables, y las aplica a esta sesión.
+
+    Una línea ``CLAVE=...`` existente se reemplaza; si no existe, se agrega al final.
+    Un valor vacío deja la clave vacía (desactivada).
+    """
+    ruta = Path(ruta or RUTA_ENV)
+    lineas = ruta.read_text(encoding="utf-8").splitlines() if ruta.is_file() else []
+    pendientes = dict(valores)
+    for indice, linea in enumerate(lineas):
+        limpia = linea.strip()
+        if not limpia or limpia.startswith("#") or "=" not in limpia:
+            continue
+        clave = limpia.split("=", 1)[0].strip()
+        if clave in pendientes:
+            lineas[indice] = f"{clave}={pendientes.pop(clave)}"
+    lineas += [f"{clave}={valor}" for clave, valor in pendientes.items()]
+    temporal = ruta.with_suffix(".tmp")
+    temporal.write_text("\n".join(lineas) + "\n", encoding="utf-8")
+    os.replace(temporal, ruta)  # nunca deja un .env a medio escribir
+    for clave, valor in valores.items():
+        os.environ[clave] = valor
+        if clave in {"GEMINI_API_KEY", "OPENAI_API_KEY"}:
+            globals()[clave] = valor  # los proveedores leen config.* en cada llamada
+
+
 _cargar_env_local()
 # --- Carpeta de resultados en el escritorio ---
 import pathlib
@@ -147,7 +176,13 @@ LOTE_LOCAL = max(64, int(os.getenv("BARK_LOTE_LOCAL", "512")))
 # --- Comportamiento del agente (ReAct) ---
 MAX_ITERACIONES_DEFAULT = 15   # tope de seguridad, usado si la tarea no da otro valor
 TEMPERATURA = 0.3               # bajo = mas predecible, ideal para function calling
-MAX_TOKENS_RESPUESTA = max(64, int(os.getenv("BARK_MAX_TOKENS", "160")))
+# Razonamiento breve: antes de decidir, el modelo escribe un «plan» de 1-2 frases dentro
+# del mismo JSON. Ayuda a modelos sin «thinking» (Qwen2.5, GPT-4.1-mini). auto = se
+# desactiva solo si el único cerebro es un modelo local que ya piensa (Qwen3, DeepSeek R1).
+RAZONAMIENTO = os.getenv("BARK_RAZONAMIENTO", "auto").strip().lower()
+# El plan necesita unos tokens más que la respuesta sola.
+MAX_TOKENS_RESPUESTA = max(64, int(os.getenv("BARK_MAX_TOKENS", "240")))
+MAX_PASOS_ENCADENADOS = max(1, int(os.getenv("BARK_MAX_PASOS", "4")))
 MAX_CARACTERES_OBSERVACION = 4_000
 # SQLite trabaja en modo WAL para que la UI, la voz y la biblioteca no se
 # bloqueen entre sí. El respaldo se actualiza periódicamente con la API de

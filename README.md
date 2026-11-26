@@ -176,6 +176,8 @@ Bark pide permiso antes de usar el micrófono o la cámara por primera vez y com
 
 ## 🛰️ Interfaz HUD y modo Live
 
+Bark se instala como app de escritorio: **⚙ Ajustes › Crear acceso directo** pone a Bark (con su icono de orbe) en el Escritorio y en Inicio; desde Inicio puedes anclarlo a la barra de tareas.
+
 `Iniciar_Bark.bat` abre un visor futurista sin la barra de título de Windows (el encabezado del HUD hace de barra: arrástralo, doble clic para maximizar). Sigue apareciendo en la barra de tareas y en Alt+Tab.
 
 - **Orbe central**: se agranda y achica como una bocina con tu voz mientras escucha y con la voz de Bark mientras habla (Gemini, OpenAI o Piper).
@@ -198,15 +200,19 @@ Todo se ajusta en `.env`, sin tocar código. Lo principal:
 | `BARK_MIC_DEVICE` | Índice fijo de micrófono; vacío = automático (escucha en varios y se queda con el que te oye) |
 | `BARK_MODELO_WHISPER` | `base` (rápido) o `small` (más preciso) |
 | `BARK_VOZ_DEBUG` | `1` guarda el último audio recibido para diagnosticar el micrófono |
-| `BARK_CIUDAD` | Ciudad para el clima cuando no dices cuál |
+| `BARK_CIUDAD` | Ciudad para el clima cuando no dices cuál. Sin ella se estima por IP y puede marcar otro municipio; también se cambia con clic en la ciudad del panel de clima |
 | `BARK_GEMINI_LIVE` | `auto` usa Gemini Live si hay clave de Gemini; `0` siempre el modo clásico (Whisper + voz) |
 | `GEMINI_MODELO_LIVE` | Modelo de Live (por defecto `gemini-3.8-live`) |
+| `BARK_RAZONAMIENTO` | `auto` (por defecto): el modelo escribe un plan breve antes de actuar si no «piensa» por sí mismo; `1` siempre, `0` nunca |
+| `BARK_MAX_PASOS` | Cuántas acciones puede encadenar en una sola petición (por defecto 4) |
 | `BARK_INTERRUMPIR_VOZ` | `1` = hablar encima de Bark lo interrumpe (como Gemini Live). Mejor con audífonos |
 | `BARK_VOZ_UMBRAL_INTERRUPCION` | Qué tan fuerte hay que hablar para interrumpir (RMS, por defecto 900) |
 
 La guía completa de órdenes y ajustes está en [`docs/GUIA.md`](docs/GUIA.md).
 
 ## 🔌 Conectores y MCP
+
+Dile a Bark «conecta ElevenLabs» o «¿qué conectores puedes instalar?» y él mismo los instala; también guarda **habilidades** (prompts reutilizables) cuando le enseñas cómo quieres algo.
 
 Abre **Conectores y herramientas** en la interfaz o di «¿qué conectores tienes?» para ver qué está listo en tu equipo. Para sumar servicios externos, copia `config/conectores_mcp.example.json` como `conectores_mcp.json` y activa servidores MCP (archivos, GitHub, fetch…); los tokens van en `.env`.
 

@@ -20,7 +20,7 @@ __all__ = ["REGISTRO", "Herramienta", "Resultado", "cargar"]
 
 _MODULOS = (
     "integrados", "archivos_extra", "info_equipo", "red", "software", "productividad",
-    "comunicacion", "informacion", "navegacion", "desarrollo", "teclado", "mcp",
+    "comunicacion", "informacion", "navegacion", "desarrollo", "teclado", "mcp", "creador", "habilidades",
 )
 
 REGISTRO.conector("nucleo", "Núcleo de Bark", "Buscar herramientas, ver conectores y recargar servidores MCP.")

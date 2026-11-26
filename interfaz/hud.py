@@ -44,6 +44,101 @@ def texto_seguro(texto: str) -> str:
     return "".join(c for c in str(texto or "") if ord(c) <= 0xFFFF).strip()
 
 
+def _color_hex(widget: tk.Misc, color: str) -> str:
+    """Cualquier color de Tk («SystemButtonFace», «white», «#abc») → #rrggbb."""
+    if isinstance(color, str) and len(color) == 7 and color.startswith("#"):
+        return color
+    r, g, b = widget.winfo_rgb(color)
+    return f"#{r // 256:02x}{g // 256:02x}{b // 256:02x}"
+
+
+def burbuja_en_boton(boton: tk.Button, x: int, y: int, color: str | None = None) -> None:
+    """Efecto burbuja: un círculo de luz crece desde donde hiciste clic y se desvanece (~0.3 s).
+
+    Se dibuja en un lienzo temporal encima del botón con su mismo texto, así que el
+    botón no cambia de tamaño ni mueve a sus vecinos.
+    """
+    try:
+        if not boton.winfo_exists() or str(boton.cget("state")) == "disabled":
+            return
+        ancho, alto = boton.winfo_width(), boton.winfo_height()
+        fondo = _color_hex(boton, boton.cget("bg"))
+        # En Windows el botón es un control nativo que tapa a sus hijos: la capa va encima, como hermana.
+        lienzo = tk.Canvas(boton.master, width=ancho, height=alto, bg=fondo, highlightthickness=0, bd=0, cursor="hand2")
+        lienzo.place(in_=boton, x=0, y=0, relwidth=1, relheight=1)
+    except tk.TclError:
+        return
+    try:
+        tk.Misc.tkraise(lienzo, boton)  # Canvas.lift() movería dibujos, no el widget
+        # Clics que el lienzo recibe mientras dura la animación vuelven al botón.
+        lienzo.bind("<ButtonRelease-1>", lambda _e: boton.invoke())
+        circulo = lienzo.create_oval(x, y, x, y, outline="", fill=fondo)
+        anillo = lienzo.create_oval(x, y, x, y, outline=color or HUD["acento"], width=2)
+        lienzo.create_text(ancho / 2, alto / 2, text=boton.cget("text"), fill=boton.cget("fg"), font=boton.cget("font"))
+    except tk.TclError:
+        lienzo.destroy()  # nunca dejar una capa tapando el botón
+        return
+    radio_max = math.hypot(max(x, ancho - x), max(y, alto - y)) + 4
+    acento = color or HUD["acento"]
+    pasos = 12
+
+    def cuadro(i=1):
+        try:
+            if not lienzo.winfo_exists():
+                return
+            t = i / pasos
+            suave = 1 - (1 - t) ** 3  # sale rápido y frena, como una burbuja
+            r = 3 + radio_max * suave
+            lienzo.coords(circulo, x - r, y - r, x + r, y + r)
+            lienzo.itemconfig(circulo, fill=mezclar(mezclar(acento, fondo, 0.45), fondo, t))
+            r2 = r * 1.08
+            lienzo.coords(anillo, x - r2, y - r2, x + r2, y + r2)
+            lienzo.itemconfig(anillo, outline=mezclar(acento, fondo, t))
+            if i < pasos:
+                lienzo.after(22, lambda: cuadro(i + 1))
+            else:
+                lienzo.destroy()
+        except tk.TclError:
+            pass
+
+    cuadro()
+
+
+def burbuja_en_lienzo(lienzo: tk.Canvas, x: float, y: float, color: str | None = None, radio: float = 26) -> None:
+    """La misma burbuja para botones dibujados dentro de un Canvas (encabezado, orbe)."""
+    acento = color or HUD["acento"]
+    fondo = _color_hex(lienzo, lienzo.cget("bg"))
+    try:
+        item = lienzo.create_oval(x, y, x, y, outline=acento, width=2)
+    except tk.TclError:
+        return
+
+    def cuadro(i=1, pasos=12):
+        try:
+            t = i / pasos
+            r = radio * (1 - (1 - t) ** 3)
+            lienzo.coords(item, x - r, y - r, x + r, y + r)
+            lienzo.itemconfig(item, outline=mezclar(acento, fondo, t))
+            if i < pasos:
+                lienzo.after(22, lambda: cuadro(i + 1))
+            else:
+                lienzo.delete(item)
+        except tk.TclError:
+            pass
+
+    cuadro()
+
+
+def instalar_burbujas(raiz: tk.Misc) -> None:
+    """Activa la burbuja en TODOS los botones de Bark, también los de ventanas que se abran después."""
+    def al_soltar(evento):
+        boton = evento.widget
+        if isinstance(boton, tk.Button) and 0 <= evento.x < boton.winfo_width() and 0 <= evento.y < boton.winfo_height():
+            burbuja_en_boton(boton, evento.x, evento.y)
+
+    raiz.bind_class("Button", "<ButtonRelease-1>", al_soltar, add="+")
+
+
 class PanelHUD(tk.Frame):
     """Marco con esquinas biseladas, título y botón opcional para agrandar/achicar."""
 
@@ -59,7 +154,7 @@ class PanelHUD(tk.Frame):
         self.cuerpo.pack(fill="both", expand=True, padx=(izquierda, derecha), pady=(arriba, abajo))
         self.lienzo.bind("<Configure>", lambda _e: self.dibujar())
         if al_expandir:
-            self.lienzo.tag_bind("expandir", "<Button-1>", lambda _e: self.alternar())
+            self.lienzo.tag_bind("expandir", "<Button-1>", lambda _e: self.after_idle(self.alternar))
             self.lienzo.tag_bind("expandir", "<Enter>", lambda _e: self.lienzo.itemconfig("expandir", fill=HUD["acento"]))
             self.lienzo.tag_bind("expandir", "<Leave>", lambda _e: self.lienzo.itemconfig("expandir", fill=HUD["suave"]))
 
@@ -146,9 +241,11 @@ class OrbeVivo(tk.Canvas):
         self.tag_bind("nucleo", "<Enter>", lambda _e: self.config(cursor="hand2"))
         self.tag_bind("nucleo", "<Leave>", lambda _e: self.config(cursor=""))
 
-    def _tocar(self, _evento=None):
+    def _tocar(self, evento=None):
+        if evento is not None:
+            burbuja_en_lienzo(self, evento.x, evento.y, radio=self.R * 0.9 if hasattr(self, "R") else 60)
         if self.al_tocar:
-            self.al_tocar()
+            self.after_idle(self.al_tocar)  # puede reconstruir el orbe: nunca dentro de su propio clic
 
     # -------------------------------------------------- geometría
     def _construir(self):

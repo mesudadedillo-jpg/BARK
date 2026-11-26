@@ -293,6 +293,60 @@ def leer_configuracion(ruta: str = RUTA_CONFIG) -> dict:
         return {}
 
 
+def _leer_archivo_config(ruta: str = RUTA_CONFIG) -> dict:
+    """El JSON completo (con «_ayuda» y demás); si no existe, parte del ejemplo."""
+    for candidato in (ruta, os.path.join(os.path.dirname(ruta), "conectores_mcp.example.json")):
+        try:
+            with open(candidato, encoding="utf-8") as archivo:
+                datos = json.load(archivo)
+                datos.setdefault("servidores", {})
+                return datos
+        except FileNotFoundError:
+            continue
+    return {"servidores": {}}
+
+
+def _escribir_archivo_config(datos: dict, ruta: str = RUTA_CONFIG) -> None:
+    temporal = ruta + ".tmp"
+    with open(temporal, "w", encoding="utf-8") as archivo:
+        json.dump(datos, archivo, ensure_ascii=False, indent=2)
+    os.replace(temporal, ruta)
+
+
+def guardar_servidor(nombre: str, ajustes: dict, ruta: str = RUTA_CONFIG) -> None:
+    """Agrega o reemplaza un servidor en conectores_mcp.json (los tokens van como ${VARIABLE})."""
+    datos = _leer_archivo_config(ruta)
+    datos["servidores"][nombre] = ajustes
+    _escribir_archivo_config(datos, ruta)
+
+
+def quitar_servidor(nombre: str, ruta: str = RUTA_CONFIG) -> bool:
+    datos = _leer_archivo_config(ruta)
+    if nombre not in datos["servidores"]:
+        return False
+    del datos["servidores"][nombre]
+    _escribir_archivo_config(datos, ruta)
+    REGISTRO.quitar_conector(f"mcp_{_id_seguro(nombre)}")
+    cliente = _clientes.pop(f"mcp_{_id_seguro(nombre)}", None)
+    if cliente:
+        try:
+            cliente.cerrar()
+        except Exception:
+            pass
+    return True
+
+
+def variables_requeridas(ruta: str = RUTA_CONFIG) -> list[str]:
+    """Variables ${...} que piden los servidores activos (para mostrarlas en ⚙ Ajustes)."""
+    encontradas = []
+    for ajustes in leer_configuracion(ruta).values():
+        if ajustes.get("activo", True):
+            for variable in re.findall(r"\$\{(\w+)\}", json.dumps(ajustes)):
+                if variable not in encontradas:
+                    encontradas.append(variable)
+    return encontradas
+
+
 def crear_cliente(nombre: str, ajustes: dict) -> ClienteMCP:
     ajustes = _expandir(ajustes)
     timeout = float(ajustes.get("timeout", 60))

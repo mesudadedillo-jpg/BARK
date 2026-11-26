@@ -52,6 +52,27 @@ Toda la lógica de parecido está en `conectores/similitud.py` (`mejores`, `eleg
 
 Cada herramienta remota aparece como `mcp_<servidor>_<herramienta>` y pide permiso salvo que el servidor la marque como de solo lectura (`readOnlyHint`) o la pongas en `"confiables"`. Un servidor que no arranca aparece como no disponible con el motivo, y Bark sigue funcionando.
 
+## Bark instala y crea conectores por sí mismo
+
+No hace falta editar JSON: díselo.
+
+| Dices… | Bark usa |
+|---|---|
+| «¿Qué conectores puedes instalar?» | `catalogo_conectores()` |
+| «Conecta ElevenLabs» / «conéctate a GitHub» | `instalar_conector(nombre)` 🔒 con la receta del catálogo |
+| «Agrega el servidor MCP `npx -y @org/servidor` con la clave NOTION_TOKEN» | `agregar_conector_mcp(nombre, comando, url, descripcion, variable_clave)` 🔒 |
+| «Quita el conector de GitHub» | `quitar_conector(nombre)` 🔒 |
+
+Catálogo incluido (recetas verificadas con la documentación oficial): **elevenlabs** (`uvx elevenlabs-mcp`, archivado desde agosto de 2026 pero funcional), **github** (remoto), **archivos**, **web** (fetch), **memoria_grafo**, **git** y **hora**. Si una receta necesita una clave, Bark la guarda como `${VARIABLE}` y el campo aparece solo en **⚙ Ajustes › Claves y datos**; nunca pide claves por el chat. Si falta `npx` o `uvx`, dice qué instalar.
+
+## Habilidades (prompts guardados)
+
+Como las *skills* de Claude: instrucciones reutilizables que Bark aplica solo cuando vienen al caso. Dile «cuando te pida un resumen de noticias, dame 3 viñetas y una conclusión; guárdalo como habilidad» y Bark redacta el prompt y lo guarda con `crear_habilidad(nombre, instrucciones, cuando_usar)`. En cada turno, `conectores/habilidades.py` busca las que coinciden con tu petición y las agrega al contexto (también llegan a Gemini Live). Se guardan en `bd_memoria/habilidades.json`; `listar_habilidades`, `ver_habilidad` y `borrar_habilidad` las administran.
+
+## Razonamiento breve
+
+Antes de decidir, el modelo puede escribir un `"plan"` de 1-2 frases dentro del mismo JSON (qué quieres, qué herramientas y en qué orden), y marcar `"continuar": true` para encadenar pasos viendo cada resultado («abre Spotify y pon Daft Punk»). Es un «pensar en voz baja» barato para modelos sin *thinking* (Qwen2.5, GPT-4.1-mini); se apaga solo si el único cerebro es un modelo local que ya piensa (Qwen3, DeepSeek R1). El plan se registra en consola como `[PLAN]` y no se muestra al usuario. Ajustes: `BARK_RAZONAMIENTO=auto|1|0` y `BARK_MAX_PASOS` (por defecto 4).
+
 ## Crear un conector nuevo
 
 ```python

@@ -209,5 +209,30 @@ class TestPermisos(unittest.TestCase):
             self.assertFalse(escuchar.solicitar_permiso_por_voz("borrar el archivo"))
 
 
+class TestGuardarEnEnv(unittest.TestCase):
+    def test_reemplaza_agrega_y_conserva_comentarios(self):
+        from pathlib import Path
+        from config import config
+        salto = chr(10)
+        carpeta = tempfile.mkdtemp()
+        ruta = Path(carpeta) / ".env"
+        ruta.write_text(salto.join(["# Mis claves", "GEMINI_API_KEY=vieja", "BARK_VOZ=local", ""]), encoding="utf-8")
+        anterior = (config.GEMINI_API_KEY, os.environ.get("GEMINI_API_KEY"), os.environ.get("BARK_PRUEBA_ENV"))
+        try:
+            config.guardar_en_env({"GEMINI_API_KEY": "nueva", "BARK_PRUEBA_ENV": "Tulantepec"}, ruta)
+            esperado = salto.join(["# Mis claves", "GEMINI_API_KEY=nueva", "BARK_VOZ=local", "BARK_PRUEBA_ENV=Tulantepec", ""])
+            self.assertEqual(ruta.read_text(encoding="utf-8"), esperado)
+            self.assertEqual(config.GEMINI_API_KEY, "nueva")  # activa sin reiniciar
+            self.assertEqual(os.environ["BARK_PRUEBA_ENV"], "Tulantepec")
+            self.assertFalse((Path(carpeta) / ".env.tmp").exists())
+        finally:
+            config.GEMINI_API_KEY = anterior[0]
+            for clave, valor in (("GEMINI_API_KEY", anterior[1]), ("BARK_PRUEBA_ENV", anterior[2])):
+                if valor is None:
+                    os.environ.pop(clave, None)
+                else:
+                    os.environ[clave] = valor
+
+
 if __name__ == "__main__":
     unittest.main()

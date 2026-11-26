@@ -213,31 +213,112 @@ def _ventanas_visibles() -> list[tuple[int, str, str]]:
     return resultado
 
 
-def ventana_reproductor(estado: dict | None) -> int | None:
-    """Encuentra la ventana que reproduce: por título (pestañas de YouTube) o por programa."""
+_NAVEGADORES = ("chrome", "msedge", "brave", "firefox", "308046b0af4a39cb", "opera", "vivaldi")
+_APPS_VIDEO = ("vlc", "zunevideo", "movies", "mediaplayer", "zunemusic", "mpc-hc", "potplayer", "netflix", "primevideo", "disney")
+
+
+def tipo_medio(estado: dict | None) -> str:
+    """video_web (pestaña del navegador), video (VLC, Reproductor…) o audio (Spotify y otras apps de música)."""
+    app = ((estado or {}).get("app_id") or "").lower()
+    if any(nombre in app for nombre in _NAVEGADORES):
+        return "video_web"
+    if any(nombre in app for nombre in _APPS_VIDEO):
+        return "video"
+    return "audio"
+
+
+def _buscar_ventana(estado: dict | None) -> tuple[int | None, str, bool]:
+    """(hwnd, título de la ventana, ¿coincidió por el título del video?)."""
     if os.name != "nt" or not estado:
-        return None
+        return None, "", False
     titulo = (estado.get("titulo") or "").lower()
     app_id = (estado.get("app_id") or "").lower()
     ventanas = _ventanas_visibles()
     for hwnd, texto, _ in ventanas:
         if titulo and titulo[:40] in texto.lower():
-            return hwnd
-    for hwnd, _, proceso in ventanas:
+            return hwnd, texto, True  # la pestaña activa es la del video
+    for hwnd, texto, proceso in ventanas:
         nombre = proceso.removesuffix(".exe")
         if nombre and (nombre in app_id or ("firefox" in nombre and "308046b0af4a39cb" in app_id)):
-            return hwnd
-    return None
+            return hwnd, texto, False
+    return None, "", False
+
+
+def ventana_reproductor(estado: dict | None) -> int | None:
+    """Encuentra la ventana que reproduce: por título (pestañas de YouTube) o por programa."""
+    return _buscar_ventana(estado)[0]
+
+
+def opciones_ventana(estado: dict | None) -> list[tuple[str, str]]:
+    """Acciones que tienen sentido para lo que suena ahora: (acción, texto para el menú)."""
+    tipo = tipo_medio(estado)
+    opciones = []
+    if tipo in {"video_web", "video"}:
+        opciones.append(("pantalla_completa", "⛶  Video a pantalla completa"))
+        if tipo == "video_web":
+            opciones.append(("mini", "▣  Mini reproductor (YouTube)"))
+        opciones.append(("salir_pantalla_completa", "⤡  Salir de pantalla completa"))
+    opciones += [("maximizar", "⤢  Maximizar la ventana"), ("restaurar", "▢  Restaurar la ventana"), ("minimizar", "—  Minimizar la ventana")]
+    return opciones
+
+
+def _enfocar(hwnd: int) -> bool:
+    usuario = ctypes.windll.user32
+    if usuario.IsIconic(hwnd):
+        usuario.ShowWindow(hwnd, 9)  # SW_RESTORE
+    usuario.SetForegroundWindow(hwnd)
+    for _ in range(10):
+        if usuario.GetForegroundWindow() == hwnd:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _pulsar(vk: int) -> None:
+    usuario = ctypes.windll.user32
+    usuario.keybd_event(vk, 0, 0, 0)
+    usuario.keybd_event(vk, 0, 2, 0)
 
 
 def ajustar_ventana_reproductor(estado: dict | None, accion: str) -> str:
-    """accion = agrandar | achicar | minimizar: actúa sobre la ventana del video o la canción."""
-    hwnd = ventana_reproductor(estado)
+    """Agranda o achica lo que suena de forma específica.
+
+    pantalla_completa: el VIDEO ocupa toda la pantalla (tecla F de YouTube, Twitch, Netflix o VLC; F11 en otros reproductores).
+    salir_pantalla_completa: Esc.   mini: mini reproductor de YouTube (tecla I).
+    maximizar | restaurar | minimizar: solo la ventana. Se aceptan agrandar/achicar como antes.
+    """
+    accion = {"agrandar": "maximizar", "achicar": "restaurar"}.get(accion, accion)
+    hwnd, titulo_ventana, por_titulo = _buscar_ventana(estado)
     if not hwnd:
         return "No encontré la ventana del reproductor."
     usuario = ctypes.windll.user32
-    comando = {"agrandar": 3, "achicar": 9, "minimizar": 6}.get(accion, 9)  # SW_MAXIMIZE / SW_RESTORE / SW_MINIMIZE
-    usuario.ShowWindow(hwnd, comando)
-    if accion != "minimizar":
+    if accion in {"maximizar", "restaurar", "minimizar"}:
+        usuario.ShowWindow(hwnd, {"maximizar": 3, "restaurar": 9, "minimizar": 6}[accion])
+        if accion != "minimizar":
+            usuario.SetForegroundWindow(hwnd)
+        return {"maximizar": "Ventana del reproductor maximizada.", "restaurar": "Ventana del reproductor restaurada.",
+                "minimizar": "Ventana del reproductor minimizada."}[accion]
+
+    tipo = tipo_medio(estado)
+    if tipo == "audio":
+        usuario.ShowWindow(hwnd, 3)
         usuario.SetForegroundWindow(hwnd)
-    return {"agrandar": "Reproductor maximizado.", "achicar": "Reproductor restaurado.", "minimizar": "Reproductor minimizado."}[accion]
+        return "Es música, no video: maximicé la ventana del reproductor."
+    if tipo == "video_web" and not por_titulo:
+        # La pestaña visible no es la del video: una tecla iría a otra página.
+        _enfocar(hwnd)
+        return "El video está en otra pestaña: ábrela y vuelve a intentarlo."
+    if not _enfocar(hwnd):
+        return "Windows no me dejó traer el reproductor al frente; haz clic en él y vuelve a intentarlo."
+    time.sleep(0.15)
+    if accion == "salir_pantalla_completa":
+        _pulsar(0x1B)  # Esc
+        return "Salí de la pantalla completa."
+    if accion == "mini":
+        if "youtube" not in titulo_ventana.lower():
+            return "El mini reproductor solo está disponible en YouTube."
+        _pulsar(0x49)  # I
+        return "Mini reproductor de YouTube activado."
+    vlc = "vlc" in (estado.get("app_id") or "").lower()
+    _pulsar(0x46 if tipo == "video_web" or vlc else 0x7A)  # F en la web y VLC; F11 en otros reproductores
+    return "Video a pantalla completa (Esc para salir)."

@@ -13,11 +13,12 @@ import threading
 import time
 import tkinter as tk
 from datetime import datetime
-from tkinter import colorchooser, messagebox, scrolledtext
+from tkinter import colorchooser, messagebox, scrolledtext, simpledialog
 
 from acciones import comandos
 from config import config
-from interfaz.hud import ESTADOS, FUENTE_HUD, FUENTE_TEXTO, HUD, BarraHUD, OrbeVivo, PanelHUD, mezclar, texto_seguro
+from interfaz.hud import (ESTADOS, FUENTE_HUD, FUENTE_TEXTO, HUD, BarraHUD, OrbeVivo, PanelHUD, burbuja_en_lienzo,
+                          instalar_burbujas, mezclar, texto_seguro)
 from nucleo.bd_manager import biblioteca_conversaciones, buscar_recuerdos, estadisticas_biblioteca
 from nucleo.cerebro import configurar_solicitador_permiso, procesar_mensaje
 from nucleo.escuchar import (
@@ -26,7 +27,7 @@ from nucleo.escuchar import (
     seleccionar_modelo_whisper, seleccionar_motor_voz, seleccionar_voz_local,
     solicitar_permiso_por_voz, voces_locales_disponibles,
 )
-from nucleo import audio_vivo, descargas, gemini_live, medios, permisos
+from nucleo import audio_vivo, descargas, escritorio, gemini_live, medios, permisos
 from nucleo.bd_manager import guardar_turno
 from nucleo.proveedores import estado_proveedores
 from nucleo.telemetria import Telemetria
@@ -92,8 +93,17 @@ def _formato_tiempo(segundos: float) -> str:
 
 class VentanaBark:
     def __init__(self):
+        escritorio.registrar_identidad()  # antes de la ventana: la barra de tareas muestra el orbe, no Python
         self.raiz = tk.Tk()
         self.raiz.title("Bark — Asistente personal")
+        instalar_burbujas(self.raiz)  # efecto burbuja al pulsar cualquier botón
+        self._logo_encabezado = None
+        try:
+            self.raiz.iconbitmap(default=escritorio.RUTA_ICONO)  # también para las ventanas secundarias
+            self._icono = tk.PhotoImage(file=escritorio.RUTA_LOGO)
+            self.raiz.iconphoto(True, self._icono)
+        except tk.TclError:
+            pass
         self.raiz.geometry("1360x820")
         self.raiz.minsize(1080, 680)
         self.raiz.configure(bg=HUD["fondo"])
@@ -152,10 +162,17 @@ class VentanaBark:
             pass
         self.microfono = tk.StringVar(value=next((nombre for nombre, indice in self.dispositivos_mic.items() if indice == config.DISPOSITIVO_ENTRADA_VOZ), AUTOMATICO_MIC))
         configurar_solicitador_permiso(self._pedir_permiso)
+        # La ciudad elegida en el panel de clima manda sobre .env (y la usan también la voz y Gemini Live).
+        ciudad_guardada = permisos.preferencia("ciudad")
+        if ciudad_guardada:
+            os.environ["BARK_CIUDAD"] = ciudad_guardada
         self._construir()
         self.raiz.after(20, self._integrar_con_windows)
         self.raiz.protocol("WM_DELETE_WINDOW", self._cerrar)
         self.medios.iniciar()
+        if not (config.GEMINI_API_KEY or config.OPENAI_API_KEY):
+            self._agregar("Sistema", "Sin claves de Gemini ni OpenAI Bark funciona en local. Para voces de nube y Gemini Live, "
+                                     "agrégalas en ⚙ Ajustes › Claves y datos.", "sistema")
         self._animar()
         self._tic_reloj()
         self._tic_sistema()
@@ -173,6 +190,13 @@ class VentanaBark:
         try:
             usuario = ctypes.windll.user32
             self._hwnd_principal = hwnd = _hwnd(self.raiz)
+            # Icono del orbe para la barra de tareas y Alt+Tab (la ventana sin marco no hereda el de Tk).
+            usuario.LoadImageW.restype = ctypes.c_void_p
+            usuario.SendMessageW.argtypes = (ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_void_p)
+            for tipo, lado in ((1, usuario.GetSystemMetrics(11)), (0, usuario.GetSystemMetrics(49))):  # SM_CXICON / SM_CXSMICON
+                icono = usuario.LoadImageW(None, escritorio.RUTA_ICONO, 1, lado, lado, 0x10)  # IMAGE_ICON, LR_LOADFROMFILE
+                if icono:
+                    usuario.SendMessageW(hwnd, 0x80, tipo, icono)  # WM_SETICON (1 = grande, 0 = chico)
             extendido = usuario.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
             usuario.SetWindowLongW(hwnd, -20, (extendido & ~0x00000080) | 0x00040000)  # sin TOOLWINDOW, con APPWINDOW
             estilo = usuario.GetWindowLongW(hwnd, -16)  # GWL_STYLE
@@ -247,6 +271,15 @@ class VentanaBark:
         self.raiz.geometry(f"{nuevo_ancho}x{nuevo_alto}")
 
     def _cerrar(self):
+        """Apaga voz, multimedia y cámara y cierra la ventana.
+
+        La destrucción se aplaza un instante: si se hace dentro del clic sobre la ✕
+        (dibujada en un Canvas), Tk 9 sigue usando el lienzo ya liberado y se cae con
+        «alloc: invalid block».
+        """
+        if getattr(self, "_cerrando", False):
+            return
+        self._cerrando = True
         self.detener_voz.set()
         if self.sesion_live:
             self._live_parado_por_usuario = True
@@ -255,7 +288,11 @@ class VentanaBark:
         self.medios.detener()
         if self.vision.activa:
             self.vision.detener()
-        self.raiz.destroy()
+        try:
+            self.raiz.withdraw()  # desaparece al instante; se destruye cuando Tk termina el evento
+            self.raiz.after(60, self.raiz.destroy)
+        except tk.TclError:
+            pass
 
     # ============================================================
     # Construcción del HUD
@@ -307,7 +344,8 @@ class VentanaBark:
             "b_min": self._minimizar, "b_max": self._alternar_maximizar, "b_cerrar": self._cerrar,
         }
         for etiqueta, orden in acciones.items():
-            self.encabezado.tag_bind(etiqueta, "<ButtonRelease-1>", lambda _e, o=orden: o())
+            self.encabezado.tag_bind(etiqueta, "<ButtonRelease-1>",
+                                     lambda e, o=orden: (burbuja_en_lienzo(self.encabezado, e.x, e.y), self.raiz.after_idle(o)))
             self.encabezado.tag_bind(etiqueta, "<Enter>", lambda _e, t=etiqueta: self._resaltar_boton(t, True))
             self.encabezado.tag_bind(etiqueta, "<Leave>", lambda _e, t=etiqueta: self._resaltar_boton(t, False))
 
@@ -339,12 +377,16 @@ class VentanaBark:
         color_estado, texto_estado = self._estado_visual()
         # Marca: hexágono y nombre.
         cx, cy = 34, 31
-        puntos = []
-        for i in range(6):
-            ang = math.radians(60 * i + 30)
-            puntos += [cx + math.cos(ang) * 15, cy + math.sin(ang) * 15]
-        c.create_polygon(puntos, outline=HUD["acento"], fill=HUD["panel"], width=2)
-        c.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, fill=color_estado, outline="")
+        logo = self._logo_pequeno()
+        if logo:
+            c.create_image(cx, cy, image=logo)
+        else:
+            puntos = []
+            for i in range(6):
+                ang = math.radians(60 * i + 30)
+                puntos += [cx + math.cos(ang) * 15, cy + math.sin(ang) * 15]
+            c.create_polygon(puntos, outline=HUD["acento"], fill=HUD["panel"], width=2)
+        c.create_oval(cx + 10, cy + 10, cx + 16, cy + 16, fill=color_estado, outline=HUD["fondo"], width=2)
         c.create_text(60, 24, text="BARK", anchor="w", fill=HUD["acento"], font=(FUENTE_HUD, 20, "bold"))
         c.create_text(61, 45, text="SISTEMA DE INTELIGENCIA PERSONAL  ·  LOCAL FIRST", anchor="w",
                       fill=HUD["tenue"], font=(FUENTE_HUD, 7))
@@ -379,6 +421,24 @@ class VentanaBark:
         c.create_line(0, 61, w, 61, fill=HUD["borde"])
         c.create_line(0, 61, 220, 61, fill=HUD["linea"], width=2)
         c.create_line(w - 220, 61, w, 61, fill=HUD["linea"], width=2)
+
+    def _logo_pequeno(self):
+        if self._logo_encabezado is None:
+            try:
+                from PIL import Image, ImageTk
+                with Image.open(escritorio.RUTA_LOGO) as imagen:
+                    self._logo_encabezado = ImageTk.PhotoImage(imagen.convert("RGBA").resize((44, 44), Image.LANCZOS))
+            except Exception:
+                self._logo_encabezado = False
+        return self._logo_encabezado or None
+
+    def _crear_accesos_directos(self):
+        try:
+            rutas = escritorio.crear_accesos()
+            self._agregar("Sistema", "Accesos directos creados en el Escritorio y en Inicio. Para anclarlo: clic derecho en Bark "
+                                     "(en Inicio) › Anclar a la barra de tareas.", "sistema")
+        except Exception as error:
+            self._agregar("Sistema", f"No pude crear los accesos directos: {error}", "sistema")
 
     def _estado_visual(self):
         color, etiqueta, _ = ESTADOS.get(self.estado, ESTADOS["en espera"])
@@ -436,8 +496,12 @@ class VentanaBark:
         self.clima_desc = tk.Label(columna, text="Consultando…", bg=HUD["panel"], fg=HUD["texto"], anchor="w",
                                    font=(FUENTE_TEXTO, 10, "bold"))
         self.clima_desc.pack(fill="x")
-        self.clima_ciudad = tk.Label(columna, text="", bg=HUD["panel"], fg=HUD["suave"], anchor="w", font=(FUENTE_TEXTO, 8))
+        self.clima_ciudad = tk.Label(columna, text="", bg=HUD["panel"], fg=HUD["suave"], anchor="w", font=(FUENTE_TEXTO, 8),
+                                     cursor="hand2")
         self.clima_ciudad.pack(fill="x")
+        self.clima_ciudad.bind("<Button-1>", lambda _e: self._cambiar_ciudad())
+        self.clima_ciudad.bind("<Enter>", lambda _e: (self.clima_ciudad.config(fg=HUD["acento"]), self._pista("Clic para cambiar la ciudad del clima")))
+        self.clima_ciudad.bind("<Leave>", lambda _e: (self.clima_ciudad.config(fg=HUD["suave"]), self._pista("")))
         self.clima_detalle = tk.Label(panel.cuerpo, text="", bg=HUD["panel"], fg=HUD["suave"], anchor="w",
                                       font=(FUENTE_HUD, 8), justify="left")
         self.clima_detalle.pack(fill="x", padx=10, pady=(2, 8))
@@ -532,13 +596,21 @@ class VentanaBark:
         self.medios_portada = tk.Label(fila, bg=HUD["panel2"], fg=HUD["acento"], text="♪", width=4, height=2,
                                        font=(FUENTE_TEXTO, 18), bd=0)
         self.medios_portada.pack(side="left")
+        # Botón grande de reproducir/pausa: ▶ cuando está en pausa, ❚❚ cuando suena.
+        self.boton_play = tk.Canvas(fila, width=60, height=60, bg=HUD["panel"], highlightthickness=0, bd=0, cursor="hand2")
+        self.boton_play.pack(side="right", padx=(6, 0))
+        self._play_hover = False
+        self._play_forzado = None  # (reproduciendo, hasta) tras un clic, mientras Windows confirma
+        self.boton_play.bind("<ButtonRelease-1>", self._clic_play)
+        self.boton_play.bind("<Enter>", lambda _e: self._hover_play(True))
+        self.boton_play.bind("<Leave>", lambda _e: self._hover_play(False))
         self._medios_info = info = tk.Frame(fila, bg=HUD["panel"])
         info.pack(side="left", fill="x", expand=True, padx=(10, 0))
         self.medios_titulo = tk.Label(info, text="Nada sonando", bg=HUD["panel"], fg=HUD["texto"], anchor="w",
-                                      justify="left", wraplength=180, font=(FUENTE_TEXTO, 10, "bold"))
+                                      justify="left", wraplength=130, font=(FUENTE_TEXTO, 10, "bold"))
         self.medios_titulo.pack(fill="x")
         self.medios_artista = tk.Label(info, text="Reproduce música o un video", bg=HUD["panel"], fg=HUD["suave"],
-                                       anchor="w", justify="left", wraplength=180, font=(FUENTE_TEXTO, 8))
+                                       anchor="w", justify="left", wraplength=130, font=(FUENTE_TEXTO, 8))
         self.medios_artista.pack(fill="x")
         self.medios_app = tk.Label(info, text="", bg=HUD["panel"], fg=HUD["acento"], anchor="w", font=(FUENTE_HUD, 7, "bold"))
         self.medios_app.pack(fill="x", pady=(2, 0))
@@ -550,14 +622,16 @@ class VentanaBark:
         controles.pack(fill="x", padx=6, pady=(2, 8))
         for texto, orden, ayuda in (
             ("⏮", lambda: medios.tecla("anterior"), "Anterior"),
-            ("⏯", lambda: medios.tecla("reproducir"), "Reproducir / pausa"),
             ("⏭", lambda: medios.tecla("siguiente"), "Siguiente"),
             ("♪−", lambda: medios.tecla("bajar"), "Bajar volumen"),
             ("♪+", lambda: medios.tecla("subir"), "Subir volumen"),
-            ("⤢", lambda: self._ventana_reproductor("agrandar"), "Agrandar el reproductor"),
-            ("⤡", lambda: self._ventana_reproductor("achicar"), "Achicar el reproductor"),
+            ("⤢", lambda: self._menu_agrandar(), "Agrandar: video a pantalla completa, mini reproductor o ventana"),
+            ("⤡", lambda: self._ventana_reproductor("achicar"), "Achicar: salir de pantalla completa o restaurar la ventana"),
         ):
-            self._boton_icono(controles, texto, orden, ayuda).pack(side="left", padx=2, expand=True, fill="x")
+            boton = self._boton_icono(controles, texto, orden, ayuda)
+            boton.pack(side="left", padx=2, expand=True, fill="x")
+            if texto == "⤢":
+                self._boton_agrandar = boton
 
     def _construir_panel_voz(self, padre):
         panel = PanelHUD(padre, "ENLACE DE VOZ")
@@ -669,6 +743,7 @@ class VentanaBark:
         self.cajon.bind("<Leave>", lambda _evento: self.raiz.unbind_all("<MouseWheel>"))
 
         self.descripcion_estado = tk.Label(lateral, text="", wraplength=280, font=(FUENTE_TEXTO, 9), fg=HUD["suave"], bg=HUD["panel"], justify="left")
+        self._construir_claves(lateral)
         self._etiqueta_seccion(lateral, "MICRÓFONO Y ESCUCHA")
         self._etiqueta_pequena(lateral, "MICRÓFONO DE ENTRADA")
         self._selector(lateral, self.microfono, tuple(self.dispositivos_mic), self._cambiar_microfono).pack(fill="x", pady=(2, 8))
@@ -697,8 +772,6 @@ class VentanaBark:
         self.selector_voz_local = self._selector(lateral, self.voz_seleccionada, voces, self._cambiar_voz)
         self.selector_voz_local.pack(fill="x", pady=(2, 5))
         self._boton(lateral, "Descargar voces optimizadas", self._descargar_voces).pack(fill="x", pady=(0, 8))
-        tk.Label(lateral, text="Las claves GEMINI_API_KEY y OPENAI_API_KEY van en el archivo .env.", wraplength=280,
-                 justify="left", font=(FUENTE_TEXTO, 8), fg=HUD["tenue"], bg=HUD["panel"]).pack(anchor="w")
         self._etiqueta_seccion(lateral, "VISIÓN")
         self.boton_vision = self._boton(lateral, "Activar visión local", self._alternar_vision)
         self.boton_vision.pack(fill="x", pady=4)
@@ -721,15 +794,161 @@ class VentanaBark:
         self._boton(lateral, "Limpiar temporales", lambda: self._enviar_consulta("Limpiar temporales")).pack(fill="x", pady=4)
         self._etiqueta_seccion(lateral, "APARIENCIA Y SISTEMA")
         self._boton(lateral, "Personalizar colores", self._personalizar_colores).pack(fill="x", pady=4)
+        self._boton(lateral, "Crear acceso directo (Escritorio e Inicio)", self._crear_accesos_directos).pack(fill="x", pady=4)
         self._boton(lateral, "Limpiar conversación", self._limpiar_chat).pack(fill="x", pady=4)
         self._boton(lateral, "Reiniciar Bark", self._reiniciar_bark).pack(fill="x", pady=(12, 4))
         tk.Label(lateral, text=estado_proveedores(), justify="left", wraplength=280, font=(FUENTE_TEXTO, 8),
                  fg=HUD["suave"], bg=HUD["panel"]).pack(anchor="w", pady=(10, 14))
         self._ajustes_abiertos = False
 
+    # ---------------------------------------------------------- claves y datos
+    _CAMPOS = (
+        # clave en .env, etiqueta, ¿secreta?, dónde conseguirla
+        ("GEMINI_API_KEY", "GEMINI · CLAVE DE API (voz, Live y respuestas)", True, "https://aistudio.google.com/apikey"),
+        ("OPENAI_API_KEY", "OPENAI / CHATGPT · CLAVE DE API (respaldo)", True, "https://platform.openai.com/api-keys"),
+        ("GITHUB_TOKEN", "GITHUB · TOKEN (opcional, conectores MCP)", True, "https://github.com/settings/tokens"),
+        ("BARK_CIUDAD", "TU CIUDAD (clima y hora local)", False, None),
+    )
+
+    def _construir_claves(self, padre):
+        """Campos para las claves y datos que Bark necesita; se guardan en .env de este equipo."""
+        self._etiqueta_seccion(padre, "CLAVES Y DATOS")
+        self._campos = {}
+        for clave, etiqueta, secreta, enlace in self._CAMPOS:
+            cabecera = tk.Frame(padre, bg=HUD["panel"])
+            cabecera.pack(fill="x", pady=(4, 0))
+            tk.Label(cabecera, text=etiqueta, font=(FUENTE_HUD, 7, "bold"), fg=HUD["suave"], bg=HUD["panel"]).pack(side="left")
+            estado = tk.Label(cabecera, text="", font=(FUENTE_HUD, 7, "bold"), fg=HUD["tenue"], bg=HUD["panel"])
+            estado.pack(side="right")
+            fila = tk.Frame(padre, bg=HUD["panel2"], highlightthickness=1, highlightbackground=HUD["borde"])
+            fila.pack(fill="x", pady=(2, 0))
+            campo = tk.Entry(fila, bg=HUD["panel2"], fg=HUD["texto"], insertbackground=HUD["acento"], relief="flat",
+                             font=(FUENTE_TEXTO, 9), show="•" if secreta else "")
+            campo.pack(side="left", fill="x", expand=True, ipady=5, padx=(8, 4))
+            campo.insert(0, os.getenv(clave, ""))
+            campo.bind("<FocusIn>", lambda _e, f=fila: f.config(highlightbackground=HUD["linea"]))
+            campo.bind("<FocusOut>", lambda _e, f=fila: f.config(highlightbackground=HUD["borde"]))
+            if enlace:
+                obtener = tk.Label(fila, text="obtener ↗", font=(FUENTE_TEXTO, 7), fg=HUD["linea"], bg=HUD["panel2"], cursor="hand2")
+                obtener.pack(side="right", padx=(0, 8))
+                obtener.bind("<Button-1>", lambda _e, url=enlace: __import__("webbrowser").open(url))
+            self._campos[clave] = (campo, estado, secreta)
+        # Claves que piden los conectores instalados (p. ej. ELEVENLABS_API_KEY) aparecen aquí solas.
+        self._marco_claves_extra = tk.Frame(padre, bg=HUD["panel"])
+        self._marco_claves_extra.pack(fill="x")
+        self._refrescar_claves_extra()
+        self._marcar_campos_vacios()
+        botones = tk.Frame(padre, bg=HUD["panel"])
+        botones.pack(fill="x", pady=(8, 2))
+        self._boton_mostrar = self._boton(botones, "👁  Mostrar", self._alternar_mostrar_claves)
+        self._boton_mostrar.pack(side="left", padx=(0, 6))
+        self._boton(botones, "Guardar y probar", self._guardar_claves).pack(side="left", fill="x", expand=True)
+        tk.Label(padre, text="Se guardan solo en el archivo .env de este equipo; nunca se envían a otro sitio "
+                             "que no sea su propio servicio.", wraplength=290, justify="left",
+                 font=(FUENTE_TEXTO, 7), fg=HUD["tenue"], bg=HUD["panel"]).pack(anchor="w", pady=(2, 4))
+
+    def _refrescar_claves_extra(self):
+        """Un campo por cada ${VARIABLE} que usan los conectores MCP activos."""
+        fijas = {clave for clave, *_ in self._CAMPOS} | {"USERPROFILE"}
+        for clave in [c for c in self._campos if c not in fijas]:
+            del self._campos[clave]
+        for hijo in self._marco_claves_extra.winfo_children():
+            hijo.destroy()
+        try:
+            from conectores import creador, mcp
+            variables = [v for v in mcp.variables_requeridas() if v not in fijas]
+            enlaces = {v: url for receta in creador.CATALOGO.values() for v, url in receta.get("claves", {}).items()}
+        except Exception:
+            variables, enlaces = [], {}
+        for clave in variables:
+            cabecera = tk.Frame(self._marco_claves_extra, bg=HUD["panel"])
+            cabecera.pack(fill="x", pady=(4, 0))
+            tk.Label(cabecera, text=f"{clave.replace('_', ' ')} (conector)", font=(FUENTE_HUD, 7, "bold"),
+                     fg=HUD["suave"], bg=HUD["panel"]).pack(side="left")
+            estado = tk.Label(cabecera, text="", font=(FUENTE_HUD, 7, "bold"), fg=HUD["tenue"], bg=HUD["panel"])
+            estado.pack(side="right")
+            fila = tk.Frame(self._marco_claves_extra, bg=HUD["panel2"], highlightthickness=1, highlightbackground=HUD["borde"])
+            fila.pack(fill="x", pady=(2, 0))
+            campo = tk.Entry(fila, bg=HUD["panel2"], fg=HUD["texto"], insertbackground=HUD["acento"], relief="flat",
+                             font=(FUENTE_TEXTO, 9), show="•")
+            campo.pack(side="left", fill="x", expand=True, ipady=5, padx=(8, 4))
+            campo.insert(0, os.getenv(clave, ""))
+            if clave in enlaces:
+                obtener = tk.Label(fila, text="obtener ↗", font=(FUENTE_TEXTO, 7), fg=HUD["linea"], bg=HUD["panel2"], cursor="hand2")
+                obtener.pack(side="right", padx=(0, 8))
+                obtener.bind("<Button-1>", lambda _e, url=enlaces[clave]: __import__("webbrowser").open(url))
+            self._campos[clave] = (campo, estado, True)
+
+    def _marcar_campos_vacios(self):
+        for clave, (campo, estado, secreta) in self._campos.items():
+            if not campo.get().strip():
+                estado.config(text="FALTA" if clave in {"GEMINI_API_KEY", "BARK_CIUDAD"} else "VACÍA",
+                              fg=HUD["ambar"] if clave in {"GEMINI_API_KEY", "BARK_CIUDAD"} else HUD["tenue"])
+            elif not estado.cget("text").startswith(("✓", "✗")):
+                estado.config(text="GUARDADA" if secreta else "", fg=HUD["tenue"])
+
+    def _alternar_mostrar_claves(self):
+        ocultas = any(campo.cget("show") for campo, _e, secreta in self._campos.values() if secreta)
+        for campo, _estado, secreta in self._campos.values():
+            if secreta:
+                campo.config(show="" if ocultas else "•")
+        self._boton_mostrar.config(text="🙈  Ocultar" if ocultas else "👁  Mostrar")
+
+    def _guardar_claves(self):
+        valores = {clave: campo.get().strip() for clave, (campo, _e, _s) in self._campos.items()}
+        for clave, (campo, estado, secreta) in self._campos.items():
+            if secreta and any(c.isspace() for c in valores[clave]):
+                estado.config(text="✗ TIENE ESPACIOS", fg=HUD["rosa"])
+                return
+        try:
+            config.guardar_en_env(valores)
+        except OSError as error:
+            self._agregar("Sistema", f"No pude guardar en .env: {error}", "sistema")
+            return
+        # La ciudad del panel de clima y la de aquí son la misma.
+        permisos.guardar_preferencia("ciudad", valores["BARK_CIUDAD"] or None)
+        if not gemini_live.disponible():
+            self.usar_gemini_live.set(False)
+        self._actualizar_clima(programar=False)
+        self._refrescar_motores()
+        self._refrescar_nucleo()
+        self._dibujar_pie()
+        for clave in ("GEMINI_API_KEY", "OPENAI_API_KEY"):
+            estado = self._campos[clave][1]
+            estado.config(text="PROBANDO…" if valores[clave] else "", fg=HUD["suave"])
+        self._marcar_campos_vacios()
+        self._agregar("Sistema", "Claves y datos guardados en .env; ya están activos, sin reiniciar.", "sistema")
+
+        def probar():
+            from nucleo.proveedores import diagnosticar_proveedores
+            try:
+                resultado = diagnosticar_proveedores()
+            except Exception as error:  # noqa: BLE001
+                resultado = {"gemini": f"error: {error}", "openai": f"error: {error}"}
+            self.raiz.after(0, lambda: self._mostrar_prueba_claves(resultado))
+
+        threading.Thread(target=probar, name="bark-probar-claves", daemon=True).start()
+
+    def _mostrar_prueba_claves(self, resultado):
+        for nombre, clave in (("gemini", "GEMINI_API_KEY"), ("openai", "OPENAI_API_KEY")):
+            texto = resultado.get(nombre, "")
+            estado = self._campos[clave][1]
+            if "sin clave" in texto:
+                continue
+            if texto == "HTTP 200":
+                estado.config(text="✓ VÁLIDA", fg=HUD["verde"])
+            elif texto in {"HTTP 400", "HTTP 401", "HTTP 403"}:
+                estado.config(text="✗ RECHAZADA", fg=HUD["rosa"])
+            elif texto == "HTTP 429":
+                estado.config(text="✓ VÁLIDA · SIN CUOTA", fg=HUD["ambar"])
+            else:
+                estado.config(text="? SIN CONEXIÓN", fg=HUD["ambar"])
+
     def _alternar_ajustes(self):
         self._ajustes_abiertos = not self._ajustes_abiertos
         if self._ajustes_abiertos:
+            self._refrescar_claves_extra()  # por si Bark instaló un conector que pide clave
+            self._marcar_campos_vacios()
             self.cajon.place(relx=1, x=-14, y=70, anchor="ne", width=350, relheight=1, height=-104)
             self.cajon.lift()
         else:
@@ -842,6 +1061,7 @@ class VentanaBark:
         try:
             self.orbe.actualizar(self.estado, self._nivel_objetivo())
             self._dibujar_medidor(self.orbe.nivel)
+            self._dibujar_play()
         except tk.TclError:
             return
         self.raiz.after(33, self._animar)
@@ -908,7 +1128,9 @@ class VentanaBark:
         self.clima_icono.config(text=datos["icono"])
         self.clima_temp.config(text=f"{datos['temperatura']:.0f}°")
         self.clima_desc.config(text=datos["descripcion"].capitalize())
-        self.clima_ciudad.config(text=f"{datos['ciudad']}, {datos['region']}"[:40])
+        nombre = datos["ciudad"] if len(datos["ciudad"]) <= 22 else datos["ciudad"].split(" de ")[0]
+        region = datos["region"].removeprefix("Estado de ").removeprefix("Estado ")
+        self.clima_ciudad.config(text=f"📍 {nombre}, {region}"[:44])
         self.clima_detalle.config(text=f"SENSACIÓN {datos['sensacion']:.0f}°   ·   HUMEDAD {datos['humedad']}%   ·   VIENTO {datos['viento']:.0f} KM/H")
         for hijo in self.clima_pronostico.winfo_children():
             hijo.destroy()
@@ -919,6 +1141,43 @@ class VentanaBark:
             tk.Label(fila, text=dia["icono"], bg=HUD["panel"], fg=HUD["acento"], font=(FUENTE_TEXTO, 11)).pack(side="left", padx=4)
             tk.Label(fila, text=f"{dia['maxima']:.0f}° / {dia['minima']:.0f}°", bg=HUD["panel"], fg=HUD["texto"], font=(FUENTE_HUD, 9)).pack(side="left", padx=6)
             tk.Label(fila, text=f"☂ {dia['lluvia']}%", bg=HUD["panel"], fg=HUD["suave"], font=(FUENTE_HUD, 8)).pack(side="right")
+
+    def _cambiar_ciudad(self):
+        """Fija la ciudad del clima (la ubicación por IP puede marcar otro municipio)."""
+        actual = os.getenv("BARK_CIUDAD", "") or (self._clima or {}).get("ciudad", "")
+        ciudad = simpledialog.askstring("Ciudad del clima", "¿En qué ciudad o municipio estás?", initialvalue=actual, parent=self.raiz)
+        if not ciudad or not ciudad.strip():
+            return
+        ciudad = ciudad.strip()
+        self.clima_desc.config(text="Buscando…")
+
+        def trabajo():
+            try:
+                from conectores.informacion import clima_datos
+                datos = clima_datos(ciudad)
+            except Exception:
+                datos = None
+
+            def aplicar():
+                if not datos:
+                    self.clima_desc.config(text=(self._clima or {}).get("descripcion", "Sin datos").capitalize())
+                    self._agregar("Sistema", f"No encontré «{ciudad}». Prueba con el nombre del municipio, p. ej. «Santiago Tulantepec».", "sistema")
+                    return
+                permisos.guardar_preferencia("ciudad", ciudad)
+                try:
+                    config.guardar_en_env({"BARK_CIUDAD": ciudad})  # misma ciudad en .env y en Ajustes
+                except OSError:
+                    os.environ["BARK_CIUDAD"] = ciudad
+                campo = getattr(self, "_campos", {}).get("BARK_CIUDAD")
+                if campo:
+                    campo[0].delete(0, "end")
+                    campo[0].insert(0, ciudad)
+                    self._marcar_campos_vacios()
+                self._mostrar_clima(datos)
+                self._agregar("Sistema", f"Ciudad del clima: {datos['ciudad']}, {datos['region']}.", "sistema")
+            self.raiz.after(0, aplicar)
+
+        threading.Thread(target=trabajo, name="bark-ciudad", daemon=True).start()
 
     def _expandir_clima(self, expandido):
         if expandido:
@@ -958,6 +1217,50 @@ class VentanaBark:
             self.sistema_detalle.pack(fill="x", padx=10, pady=(0, 8))
         else:
             self.sistema_detalle.pack_forget()
+
+    def _reproduciendo(self):
+        """Estado del botón: lo que acabas de pulsar manda unos segundos, luego lo que informa Windows."""
+        if self._play_forzado and time.monotonic() < self._play_forzado[1]:
+            estado = self.medios.estado
+            if estado and estado["reproduciendo"] == self._play_forzado[0]:
+                self._play_forzado = None  # Windows ya lo confirmó
+            return self._play_forzado[0] if self._play_forzado else bool(estado and estado["reproduciendo"])
+        self._play_forzado = None
+        return bool(self.medios.estado and self.medios.estado["reproduciendo"])
+
+    def _clic_play(self, evento):
+        if not (0 <= evento.x <= 60 and 0 <= evento.y <= 60):
+            return
+        burbuja_en_lienzo(self.boton_play, 30, 30, radio=34)
+        if not self.medios.estado:
+            self._agregar("Multimedia", "No hay música ni video en pausa para reanudar.", "sistema")
+            return
+        medios.tecla("reproducir")
+        self._play_forzado = (not self._reproduciendo(), time.monotonic() + 3.0)
+
+    def _hover_play(self, activo):
+        self._play_hover = activo
+        self._pista(("Pausar" if self._reproduciendo() else "Reproducir") if activo else "")
+
+    def _dibujar_play(self):
+        """Círculo de neón con ▶ o ❚❚; cuando suena, su halo respira suavemente."""
+        c = self.boton_play
+        hay_medio = self.medios.estado is not None
+        sonando = self._reproduciendo()
+        color = HUD["acento"] if hay_medio else HUD["tenue"]
+        respiro = (math.sin(time.monotonic() * 3.2) + 1) / 2 if sonando else 0.0
+        c.delete("all")
+        cx = cy = 30
+        for radio, mezcla in ((28, 0.88 - 0.12 * respiro), (26, 0.72 - 0.15 * respiro)):
+            c.create_oval(cx - radio, cy - radio, cx + radio, cy + radio, outline=mezclar(color, HUD["panel"], mezcla), width=3)
+        relleno = mezclar(color, HUD["panel2"], 0.55 if self._play_hover else 0.82)
+        c.create_oval(cx - 23, cy - 23, cx + 23, cy + 23, fill=relleno, outline=color, width=2)
+        icono = "#ffffff" if self._play_hover else color
+        if sonando:  # pausa: dos barras
+            c.create_rectangle(cx - 8, cy - 9, cx - 3, cy + 9, fill=icono, outline="")
+            c.create_rectangle(cx + 3, cy - 9, cx + 8, cy + 9, fill=icono, outline="")
+        else:  # reproducir: triángulo, un poco a la derecha para verse centrado
+            c.create_polygon(cx - 6, cy - 10, cx - 6, cy + 10, cx + 11, cy, fill=icono, outline="")
 
     def _tic_medios(self):
         estado = self.medios.estado
@@ -1019,22 +1322,43 @@ class VentanaBark:
 
     def _expandir_medios(self, _expandido):
         """Agranda o achica el panel: portada grande y más espacio para el título."""
-        self.medios_titulo.config(wraplength=250 if _expandido else 180)
+        self.medios_titulo.config(wraplength=190 if _expandido else 130)
+        self.medios_artista.config(wraplength=190 if _expandido else 130)
         self._cargar_portada((self.medios.estado or {}).get("portada"))
+
+    def _menu_agrandar(self):
+        """Menú específico según lo que suena: video a pantalla completa, mini reproductor o solo la ventana."""
+        estado = self.medios.estado
+        if not estado:
+            self._agregar("Sistema", "No hay música ni video sonando ahora.", "sistema")
+            return
+        menu = tk.Menu(self.raiz, tearoff=0, bg=HUD["panel2"], fg=HUD["texto"], activebackground=COLORES["boton_activo"],
+                       activeforeground="#ffffff", bd=0, font=(FUENTE_TEXTO, 9))
+        tipo = {"video_web": "VIDEO EN EL NAVEGADOR", "video": "VIDEO", "audio": "MÚSICA"}[medios.tipo_medio(estado)]
+        menu.add_command(label=f"{tipo} · {estado['app']}", state="disabled")
+        menu.add_separator()
+        for accion, texto in medios.opciones_ventana(estado):
+            menu.add_command(label=texto, command=lambda a=accion: self._ventana_reproductor(a))
+        boton = self._boton_agrandar
+        try:
+            menu.tk_popup(boton.winfo_rootx(), boton.winfo_rooty() + boton.winfo_height())
+        finally:
+            menu.grab_release()
 
     def _ventana_reproductor(self, accion):
         estado = self.medios.estado
         if not estado:
             self._agregar("Sistema", "No hay música ni video sonando ahora.", "sistema")
             return
+        if accion == "achicar":
+            accion = "salir_pantalla_completa" if medios.tipo_medio(estado) != "audio" else "restaurar"
 
         def trabajo():
             try:
                 resultado = medios.ajustar_ventana_reproductor(estado, accion)
             except Exception as error:
                 resultado = f"No pude ajustar el reproductor: {error}"
-            if resultado.startswith("No "):
-                self.raiz.after(0, lambda: self._agregar("Sistema", resultado, "sistema"))
+            self.raiz.after(0, lambda: self._agregar("Multimedia", resultado, "sistema"))
 
         threading.Thread(target=trabajo, daemon=True).start()
 
