@@ -3,6 +3,7 @@ import os
 import uuid
 import unittest
 import requests
+import numpy as np
 from unittest.mock import patch
 
 from nucleo.cerebro import _accion_directa, _contiene_dato_sensible, _detectar_recuerdo, _parsear_respuesta_json, _respuesta_directa
@@ -201,13 +202,23 @@ class TestNucleo(unittest.TestCase):
         config.MODO_VOZ = "auto"
         config.GEMINI_API_KEY = "prueba"
         config.OPENAI_API_KEY = "prueba"
+        reproducido = []
+
+        class Salida:
+            def escribir(self, audio, frecuencia, pausa): reproducido.append(frecuencia)
+            def cerrar(self): pass
+
+        escuchar._motores_nube_bloqueados_hasta.update(Gemini=0.0, OpenAI=0.0)
         try:
-            with patch("nucleo.escuchar._hablar_con_gemini", side_effect=requests.HTTPError("429")) as gemini, \
-                 patch("nucleo.escuchar._hablar_con_openai") as openai:
+            with patch("nucleo.escuchar._sintetizar_gemini", side_effect=requests.HTTPError("429")) as gemini, \
+                 patch("nucleo.escuchar._sintetizar_openai", return_value=(np.zeros(10, dtype=np.int16), 24000)) as openai, \
+                 patch("nucleo.voz_local._Salida", Salida):
                 escuchar.hablar("Hola")
-            gemini.assert_called_once_with("Hola")
-            openai.assert_called_once_with("Hola")
+            self.assertEqual(gemini.call_args[0][0], "Hola")
+            self.assertEqual(openai.call_args[0][0], "Hola")
+            self.assertEqual(reproducido, [24000])
         finally:
+            escuchar._motores_nube_bloqueados_hasta.update(Gemini=0.0, OpenAI=0.0)
             config.MODO_VOZ = anterior_modo
             config.GEMINI_API_KEY = anterior_gemini
             config.OPENAI_API_KEY = anterior_openai

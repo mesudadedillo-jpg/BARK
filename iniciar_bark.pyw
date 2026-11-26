@@ -8,8 +8,9 @@ import time
 import traceback
 from pathlib import Path
 
-CARPETA = Path(__file__).resolve().parent / "resultados"
-CARPETA.mkdir(exist_ok=True)
+# Registros internos junto a la memoria (oculta): «resultados» queda solo para tus documentos.
+CARPETA = Path(__file__).resolve().parent / "bd_memoria" / "registros"
+CARPETA.mkdir(parents=True, exist_ok=True)
 REGISTRO = CARPETA / "bark_inicio.log"
 
 

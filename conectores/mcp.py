@@ -121,8 +121,8 @@ class ClienteStdio(ClienteMCP):
                  carpeta: str | None = None, timeout: float = 60):
         super().__init__(nombre, timeout)
         ejecutable = shutil.which(comando) or comando
-        os.makedirs(os.path.join(config.CARPETA_BASE, "resultados"), exist_ok=True)
-        self._log = open(os.path.join(config.CARPETA_BASE, "resultados", f"mcp_{nombre}.log"), "a", encoding="utf-8")
+        os.makedirs(os.path.join(config.CARPETA_BD, "registros"), exist_ok=True)
+        self._log = open(os.path.join(config.CARPETA_BD, "registros", f"mcp_{nombre}.log"), "a", encoding="utf-8")
         try:
             self._proceso = subprocess.Popen(
                 [ejecutable, *argumentos], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log,

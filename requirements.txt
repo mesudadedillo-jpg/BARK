@@ -11,4 +11,5 @@ sounddevice
 pyttsx3
 piper-tts
 faster-whisper
+websockets
 mediapipe

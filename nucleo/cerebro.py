@@ -86,14 +86,37 @@ _modelo = None
 _bloqueo_modelo = threading.RLock()
 
 
+def _capas_gpu() -> int:
+    """En modo automático solo se usa la GPU si este llama-cpp se compiló con soporte (CUDA/Vulkan)."""
+    if not config.GPU_LAYERS_AUTOMATICO:
+        return config.GPU_LAYERS
+    try:
+        import llama_cpp
+        return config.GPU_LAYERS if llama_cpp.llama_supports_gpu_offload() else 0
+    except Exception:
+        return 0
+
+
 def _crear_llama(ruta: str):
     """Instancia el modelo; si la versión de llama-cpp no admite un parámetro, lo omite."""
+    capas = _capas_gpu()
+    try:
+        return _crear_llama_con(ruta, capas)
+    except Exception:
+        if capas == 0:
+            raise
+        # Sin VRAM suficiente (u otro fallo de la GPU) se reintenta solo con CPU.
+        print("La GPU no pudo cargar el modelo; uso solo la CPU.")
+        return _crear_llama_con(ruta, 0)
+
+
+def _crear_llama_con(ruta: str, capas_gpu: int):
     argumentos = dict(
         model_path=ruta,
         n_ctx=config.CONTEXTO_MAX,
         n_threads=config.HILOS_CPU,
         n_threads_batch=config.HILOS_CPU,
-        n_gpu_layers=config.GPU_LAYERS,
+        n_gpu_layers=capas_gpu,
         n_batch=config.LOTE_LOCAL,
         use_mmap=True,
         use_mlock=False,
@@ -1040,7 +1063,10 @@ def _llamar_modelo_local(mensajes) -> str:
         except TypeError:  # Compatibilidad con versiones antiguas de llama-cpp.
             argumentos.pop("response_format")
             respuesta = modelo.create_chat_completion(**argumentos)
-    return respuesta["choices"][0]["message"]["content"].strip()
+    texto = respuesta["choices"][0]["message"]["content"] or ""
+    # Qwen3 y DeepSeek R1 pueden «pensar en voz alta» antes del JSON; eso no se muestra.
+    texto = re.sub(r"<think>.*?</think>", "", texto, flags=re.S)
+    return texto.split("</think>")[-1].strip()
 
 
 def _parsear_respuesta_json(texto: str):
